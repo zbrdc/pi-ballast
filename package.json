@@ -1,0 +1,41 @@
+{
+  "name": "pi-ballast",
+  "version": "0.1.0",
+  "description": "Physical memory pressure for pi — TUI stats, per-project attribution, and a graded intervention ladder.",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "pi",
+    "pi-package",
+    "pi-extension",
+    "memory",
+    "ram",
+    "pressure",
+    "tui"
+  ],
+  "files": [
+    "src",
+    "skills",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --experimental-strip-types --import ./test/loader.mjs --test test/*.test.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "pi": {
+    "extensions": ["./src/index.ts"],
+    "skills": ["./skills"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "@sinclair/typebox": "*",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}
