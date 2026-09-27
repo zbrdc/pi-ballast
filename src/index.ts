@@ -173,82 +173,93 @@ export default function ballast(pi: ExtensionAPI) {
 
   // Called from session_start, where claim() can actually read the registry.
   function registerTools(): void {
-  if (claim("ballast_status")) pi.registerTool({
-    name: "ballast_status",
-    label: "Ballast status",
-    description:
-      "Read current memory pressure: level (ok/watch/warn/critical), reason, and per-signal detail.",
-    parameters: Type.Object({}),
-    async execute() {
-      const pressure = await engine.readPressure(engine.readConfig(), 4_000);
-      return {
-        content: [{ type: "text", text: renderPressure(pressure) }],
-        details: { level: pressure.level, reason: pressure.reason },
-      };
-    },
-  });
+    if (claim("ballast_status")) {
+      pi.registerTool({
+        name: "ballast_status",
+        label: "Ballast status",
+        description:
+          "Read current memory pressure: level (ok/watch/warn/critical), reason, and per-signal detail.",
+        parameters: Type.Object({}),
+        async execute() {
+          const pressure = await engine.readPressure(engine.readConfig(), 4_000);
+          return {
+            content: [{ type: "text", text: renderPressure(pressure) }],
+            details: { level: pressure.level, reason: pressure.reason },
+          };
+        },
+      });
+    }
 
-  if (claim("ballast_consumers")) pi.registerTool({
-    name: "ballast_consumers",
-    label: "Ballast consumers",
-    description:
-      "List what is holding memory: top consumer process groups with size, age, and project attribution.",
-    parameters: Type.Object({}),
-    async execute() {
-      const config = engine.readConfig();
-      const snap = await engine.snapshot(config);
-      const text = [
-        renderConsumers("Top consumers", snap.consumers),
-        renderConsumers("By project", snap.threads, 8),
-      ].join("\n\n");
-      return { content: [{ type: "text", text }], details: {} };
-    },
-  });
+    if (claim("ballast_consumers")) {
+      pi.registerTool({
+        name: "ballast_consumers",
+        label: "Ballast consumers",
+        description:
+          "List what is holding memory: top consumer process groups with size, age, and project attribution.",
+        parameters: Type.Object({}),
+        async execute() {
+          const config = engine.readConfig();
+          const snap = await engine.snapshot(config);
+          const text = [
+            renderConsumers("Top consumers", snap.consumers),
+            renderConsumers("By project", snap.threads, 8),
+          ].join("\n\n");
+          return { content: [{ type: "text", text }], details: {} };
+        },
+      });
+    }
 
-  if (claim("ballast_plan")) pi.registerTool({
-    name: "ballast_plan",
-    label: "Ballast plan",
-    description:
-      "Show the relief plan: disposable processes (headless browsers, dev servers, test runners, orphaned toolchains) with safe/disruptive risk. Nothing is killed by this tool.",
-    parameters: Type.Object({}),
-    async execute() {
-      const config = engine.readConfig();
-      const { plan, snap } = await engine.makePlan(config);
-      const bands = totalsByKind(snap.consumers)
-        .slice(0, 6)
-        .map((row) => `  ${kindLabel(row.kind).padEnd(20)} ${formatBytes(row.bytes)}  (${row.count})`)
-        .join("\n");
-      const text = `${renderPlan(plan)}\n\nBy kind:\n${bands}`;
-      return {
-        content: [{ type: "text", text }],
-        details: { safeBytes: plan.safeBytes, disruptiveBytes: plan.disruptiveBytes },
-      };
-    },
-  });
+    if (claim("ballast_plan")) {
+      pi.registerTool({
+        name: "ballast_plan",
+        label: "Ballast plan",
+        description:
+          "Show the relief plan: disposable processes (headless browsers, dev servers, test runners, orphaned toolchains) with safe/disruptive risk. Nothing is killed by this tool.",
+        parameters: Type.Object({}),
+        async execute() {
+          const config = engine.readConfig();
+          const { plan, snap } = await engine.makePlan(config);
+          const bands = totalsByKind(snap.consumers)
+            .slice(0, 6)
+            .map((row) => `  ${kindLabel(row.kind).padEnd(20)} ${formatBytes(row.bytes)}  (${row.count})`)
+            .join("\n");
+          const text = `${renderPlan(plan)}\n\nBy kind:\n${bands}`;
+          return {
+            content: [{ type: "text", text }],
+            details: { safeBytes: plan.safeBytes, disruptiveBytes: plan.disruptiveBytes },
+          };
+        },
+      });
+    }
 
-  if (claim("ballast_relieve")) pi.registerTool({
-    name: "ballast_relieve",
-    label: "Ballast relieve",
-    description:
-      "Stop processes from the relief plan. Refuses anything not in the plan, re-authorizes against the live process table, and never touches editors, browsers, agents, pi, or the user's other work.",
-    parameters: Type.Object({
-      ids: Type.Array(Type.String(), {
-        description: "Candidate ids from ballast_plan, e.g. ['kill:12345:dev-server']",
-      }),
-      dryRun: Type.Optional(Type.Boolean({ description: "Report without stopping. Default false." })),
-    }),
-    async execute(_toolCallId, params) {
-      const config = engine.readConfig();
-      const result = await engine.runRelief(config, params.ids, params.dryRun ?? false);
-      const lines = [
-        `Relieved ${formatBytes(result.bytesFreed)}: ${result.succeeded} stopped, ${result.failed} refused.`,
-      ];
-      for (const item of result.items) {
-        lines.push(`  ${item.ok ? "✓" : "✗"} ${item.label} — ${item.detail}`);
-      }
-      return { content: [{ type: "text", text: lines.join("\n") }], details: { bytesFreed: result.bytesFreed } };
-    },
-  });
+    if (claim("ballast_relieve")) {
+      pi.registerTool({
+        name: "ballast_relieve",
+        label: "Ballast relieve",
+        description:
+          "Stop processes from the relief plan. Refuses anything not in the plan, re-authorizes against the live process table, and never touches editors, browsers, agents, pi, or the user's other work.",
+        parameters: Type.Object({
+          ids: Type.Array(Type.String(), {
+            description: "Candidate ids from ballast_plan, e.g. ['kill:12345:dev-server']",
+          }),
+          dryRun: Type.Optional(Type.Boolean({ description: "Report without stopping. Default false." })),
+        }),
+        async execute(_toolCallId, params) {
+          const config = engine.readConfig();
+          const result = await engine.runRelief(config, params.ids, params.dryRun ?? false);
+          const lines = [
+            `Relieved ${formatBytes(result.bytesFreed)}: ${result.succeeded} stopped, ${result.failed} refused.`,
+          ];
+          for (const item of result.items) {
+            lines.push(`  ${item.ok ? "✓" : "✗"} ${item.label} — ${item.detail}`);
+          }
+          return {
+            content: [{ type: "text", text: lines.join("\n") }],
+            details: { bytesFreed: result.bytesFreed },
+          };
+        },
+      });
+    }
   }
 }
 
