@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { defaultConfig, Engine } from "./engine";
+import { contextBrief, defaultConfig, Engine } from "./engine";
 import { BallastPanel, type PanelAction, type PanelState } from "./panel";
 import { renderConsumers, renderPlan, renderPressure } from "./render";
 import type { AutoRelieve } from "./lib/contract";
@@ -56,6 +56,22 @@ export default function ballast(pi: ExtensionAPI) {
     // Never leave the user's processes stopped behind a session that exited.
     engine.resumePaused(null);
     void engine.flush();
+  });
+
+  /* -------- context injection: live numbers under pressure -------- */
+
+  // The pi equivalent of BB's contributeInstructions. Request-local: pi
+  // restores the transcript after the call, so this informs the model
+  // without polluting history or spending a turn. It reads the guard's
+  // cached sample — a fresh read would skew the paging-rate window.
+  pi.on("context", (event) => {
+    const pressure = engine.lastReading();
+    if (!pressure) return;
+    const brief = contextBrief(pressure);
+    if (!brief) return;
+    return {
+      messages: [...event.messages, { role: "user", content: brief, timestamp: Date.now() }],
+    };
   });
 
   /* ---------------- /ballast — the dashboard ---------------- */

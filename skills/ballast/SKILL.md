@@ -42,6 +42,11 @@ when pressure clears), **steer** (messages the session holding the memory),
 **relieve** (kills — only if `autoRelieve` is configured), **escalate** (spawns
 a headless `pi` to work the plan when critical persists).
 
+Alongside the rungs, live memory status is injected into the model's context
+while pressure is elevated — a labelled one-liner, restored out of the
+transcript after each request. If a user turn seems to be preceded by a note
+about headroom or paging, that is ballast, not the user.
+
 Before diagnosing a hung or stopped build as broken, check the activity trail:
 the throttle rung may have paused it, and it will resume on its own when
 pressure clears. A paused process is not a corpse — do not kill or restart it.

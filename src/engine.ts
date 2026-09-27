@@ -34,6 +34,33 @@ export const RELIEF_COOLDOWN_MS = 2 * 60_000;
 export const STEER_COOLDOWN_MS = 10 * 60_000;
 export const ESCALATION_COOLDOWN_MS = 20 * 60_000;
 
+/**
+ * How stale a cached reading may be before the context injection stays
+ * silent. The guard's slowest cadence is one minute (ok level, sampleSeconds
+ * ×6); twice that means the guard is not running and the number would lie.
+ */
+const CONTEXT_STALE_MS = 2 * 60_000;
+
+/**
+ * The brief injected into the model's context on every request while
+ * pressure is elevated — the pi equivalent of BB's contributeInstructions.
+ * Returns null when there is nothing worth saying: level ok, or a reading
+ * too stale to trust.
+ */
+export function contextBrief(pressure: Pressure, now = Date.now()): string | null {
+  if (pressure.level === "ok") return null;
+  if (now - pressure.sample.atMs > CONTEXT_STALE_MS) return null;
+  const { sample } = pressure;
+  const parts = [`${pressure.level.toUpperCase()} — headroom ${formatBytes(sample.headroomBytes)}`];
+  if (sample.swapInRate > 0) parts.push(`paging in ${formatBytes(sample.swapInRate)}/min`);
+  parts.push(`sampled ${Math.max(0, Math.round((now - sample.atMs) / 1000))}s ago`);
+  return [
+    "Note from ballast, the memory monitor (automatic status, not a user message):",
+    `Memory pressure ${parts.join(", ")}.`,
+    "Prefer serial over parallel builds and tests. Close browsers and dev servers you started and no longer need. Use ballast_plan before stopping anything you did not start.",
+  ].join("\n");
+}
+
 /** Rung side effects, injectable so tests never touch real processes. */
 export interface GuardHooks {
   stop?: (pid: number) => void;
@@ -322,6 +349,15 @@ export class Engine {
   /** Pids currently held by the throttle rung. */
   pausedPids(): readonly number[] {
     return this.store.getMeta<number[]>("throttle-paused") ?? [];
+  }
+
+  /**
+   * The guard's most recent reading, or null before the first sample.
+   * The context injection reports this without sampling on its own —
+   * an extra read would move the paging-rate cursor (see readPressure).
+   */
+  lastReading(): Pressure | null {
+    return this.lastPressure;
   }
 
   /** Resume whatever a previous guard (or a crashed session) left stopped. */

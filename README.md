@@ -37,6 +37,8 @@ A background guard samples memory and grades pressure (`watch` → `warn` → `c
 3. **Relieve** (`autoRelieve`) — stops authorized candidates (`safe`, or `safe` + `disruptive` when `aggressive`) at `critical` (`warn` when `aggressive`). Two-minute cooldown. Re-derives targets from the live process table, so a recycled pid is never killed by a stale plan.
 4. **Escalate** (`escalate`) — spawns a headless `pi -p` with the ballast tools to work the relief plan when the machine is still `critical`. Never fires while a relief wave is landing or when the plan carries nothing actionable. Twenty-minute cooldown.
 
+Underneath the ladder, **context injection** runs continuously: while pressure is elevated, every model request carries a one-line live status (level, headroom, paging rate, sampled-ago) labelled as automatic rather than a user message. The transcript stays clean — pi restores it after each call — but the agent already knows the machine is tight and starts serializing builds on its own. Silent when pressure is `ok` or the reading is stale.
+
 Everything destructive stays off by default. Escalation is the rung of record when `autoRelieve` is `off`: nothing dies unattended — something reasons instead.
 
 ## Configure
@@ -72,7 +74,7 @@ macOS and Linux (reads `vm_stat`/`sysctl` or `/proc/meminfo`/`/proc/vmstat`).
 
 ```bash
 pnpm install --ignore-workspace
-pnpm test        # 81 tests, node --test over stripped types
+pnpm test        # 88 tests, node --test over stripped types
 pnpm typecheck   # tsc --noEmit
 ```
 
