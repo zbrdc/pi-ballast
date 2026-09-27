@@ -8,61 +8,31 @@
  * activity log, which is the record of every automatic decision the plugin
  * made on the user's behalf.
  *
- * The BB plugin kept this in sqlite. A pi extension runs in-process with the
- * agent, so a JSON file under ~/.pi/agent does the same job with no native
- * dependency: one parse on load, one debounced write on change.
+ * SQLite, via node:sqlite. This started as a JSON file, on the reasoning that
+ * a pi extension runs in-process and one 27K parse is free — which is true of
+ * one session and false of a fleet. Every session, sub-agent and headless
+ * child loads this extension, so N processes write one file, and a
+ * read-merge-write with no lock between them loses writes: measured at ten
+ * writers, half the config keys vanished and 60 flushes ballooned the sample
+ * list to 700,000 rows. node:sqlite is built into Node (no npm dependency, no
+ * experimental warning) and its writes are atomic across processes, so needing
+ * it let the whole hand-rolled merge go. The database is the concurrency
+ * story now, not a layer of code defending against itself.
  */
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import type { GuardEvent, HistoryPoint, MemorySample, PressureLevel } from "./contract";
+import { DatabaseSync } from "node:sqlite";
+import { readFileSync } from "node:fs";
+import type { GuardEvent, HistoryPoint, PressureLevel } from "./contract";
 
 /** Six hours at a ten-second sample. Enough to see a build tip the machine over. */
 const HISTORY_RETENTION_MS = 6 * 3_600_000;
 const EVENT_RETENTION = 500;
-/** Flush at most this often; the exit handler flushes whatever remains. */
-const FLUSH_DEBOUNCE_MS = 5_000;
 
-interface StoreFile {
-  meta: Record<string, unknown>;
-  samples: Array<{
-    atMs: number;
-    usedBytes: number;
-    headroomBytes: number;
-    swapUsedBytes: number;
-    compressedBytes: number;
-  }>;
-  guardEvents: Array<Omit<GuardEvent, "id"> & { id: number }>;
-  nextEventId: number;
-}
-
-/**
- * An event's identity, for the multi-process merge. Not its id: ids are
- * per-process counters, so two sessions both number their first event 1 and
- * dedup-by-id would delete one of them on write.
- */
-const eventKey = (event: { atMs: number; action: string; detail: string }): string =>
-  `${event.atMs}:${event.action}:${event.detail}`;
-
-const EMPTY: StoreFile = { meta: {}, samples: [], guardEvents: [], nextEventId: 1 };
-
-/**
- * In-memory state backed by a JSON file, written atomically.
- *
- * Writes are debounced, not synchronous — losing the last few seconds of
- * samples to a crash is fine; corrupting the file with a torn write is not.
- */
 export class Store {
-  private file: StoreFile = structuredClone(EMPTY);
-  private flushTimer: ReturnType<typeof setTimeout> | null = null;
-  private writing: Promise<void> = Promise.resolve();
+  // Definite assignment: the constructor opens the database synchronously.
+  private db!: DatabaseSync;
   private lastPruneMs = 0;
-  /**
-   * Meta keys changed since the last write, with null meaning deleted. The
-   * merge writes only these, so a process that loaded the file an hour ago
-   * cannot push its stale copy of a key over a value another process just
-   * set. Cleared once the write lands.
-   */
-  private dirty = new Map<string, unknown | null>();
+  /** Set once the legacy JSON config has been taken, so it is never re-read. */
+  private static readonly IMPORTED = "legacy-json-imported";
 
   // Explicit field: node --experimental-strip-types (the test runner) cannot
   // parse TypeScript parameter properties.
@@ -70,66 +40,153 @@ export class Store {
 
   constructor(path: string) {
     this.path = path;
-  }
-
-  async load(): Promise<void> {
-    let text: string;
-    try {
-      text = await readFile(this.path, "utf8");
-    } catch {
-      return; // first run — nothing to load
-    }
-    try {
-      const parsed = JSON.parse(text) as Partial<StoreFile>;
-      this.file.meta = parsed.meta ?? {};
-      this.file.samples = parsed.samples ?? [];
-      this.file.guardEvents = parsed.guardEvents ?? [];
-      this.file.nextEventId = parsed.nextEventId ?? this.file.guardEvents.length + 1;
-    } catch {
-      // A corrupt file is a bad surprise, not a catastrophe — start empty.
-    }
-  }
-
-  getMeta<T>(key: string): T | null {
-    const value = this.file.meta[key];
-    return value === undefined ? null : (value as T);
-  }
-
-  setMeta(key: string, value: unknown): void {
-    this.file.meta[key] = value;
-    this.dirty.set(key, value);
-    this.scheduleFlush();
-  }
-
-  deleteMeta(key: string): void {
-    delete this.file.meta[key];
-    this.dirty.set(key, null);
-    this.scheduleFlush();
+    this.open();
   }
 
   /**
-   * Retention is swept on a timer, not on every insert.
-   *
-   * The sweep costs more than the insert it would accompany, and running it
-   * every sample would mean a scan-and-drop every few seconds to remove rows
-   * that are only expiring once an hour. Sweeping every ten minutes bounds the
-   * array just as well.
+   * Kept for the Engine's async load contract. The database opens in the
+   * constructor because node:sqlite is synchronous — there was never a reason
+   * to defer it, and deferring silently turned every write issued before
+   * load() into a no-op.
    */
-  recordSample(sample: MemorySample): void {
-    this.file.samples.push({
-      atMs: sample.atMs,
-      usedBytes: sample.usedBytes,
-      headroomBytes: sample.headroomBytes,
-      swapUsedBytes: sample.swapUsedBytes,
-      compressedBytes: sample.compressedBytes,
-    });
+  async load(): Promise<void> {}
+
+  private open(): void {
+    this.db = new DatabaseSync(this.path);
+    // busy_timeout FIRST, in its own statement. Switching journal modes needs
+    // an exclusive lock, and that one statement does not honour a timeout
+    // that has not been set yet — so with ten-plus sessions opening at once
+    // it threw "database is locked" and the losing process died before it
+    // could retry. Set the timeout, then switch.
+    this.db.exec("PRAGMA busy_timeout = 5000");
+    // WAL is what makes concurrent processes safe rather than merely
+    // serialized: a reader never blocks the writer that is the leader taking a
+    // sample.
+    this.db.exec("PRAGMA journal_mode = WAL");
+    this.db.exec(`
+      PRAGMA synchronous = NORMAL;
+      CREATE TABLE IF NOT EXISTS meta (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS samples (
+        atMs            INTEGER PRIMARY KEY,
+        usedBytes       INTEGER NOT NULL,
+        headroomBytes   INTEGER NOT NULL,
+        swapUsedBytes   INTEGER NOT NULL,
+        compressedBytes INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS events (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        atMs       INTEGER NOT NULL,
+        level      TEXT,
+        action     TEXT    NOT NULL,
+        detail     TEXT    NOT NULL,
+        bytesFreed INTEGER NOT NULL,
+        threadId   TEXT
+      );
+      CREATE INDEX IF NOT EXISTS events_at ON events (atMs);
+    `);
+    this.importLegacy();
+  }
+
+  /**
+   * One-time import from the JSON file this store used to be.
+   *
+   * Only `config` is worth carrying over: it holds settings the user chose —
+   * autoRelieve, throttle, steer, protected ports — and re-typing those is
+   * worse than losing a chart. The sample history is disposable (six hours of
+   * a live quantity, and the guard is running again long before anyone looks)
+   * so it stays behind. The old file is left on disk untouched, in case
+   * something here is wrong.
+   */
+  private importLegacy(): void {
+    if (this.getMeta(Store.IMPORTED) !== null) return;
+    this.setMeta(Store.IMPORTED, true);
+    const legacy = this.path.replace(/\.db$/, ".json");
+    if (legacy === this.path) return; // tests use .json paths; nothing to migrate
+
+    let parsed: { meta?: Record<string, unknown> };
+    try {
+      parsed = JSON.parse(readFileSync(legacy, "utf8")) as { meta?: Record<string, unknown> };
+    } catch {
+      // No legacy file, or unreadable. A fresh database is the correct
+      // starting state, not a failure worth surfacing.
+      return;
+    }
+    for (const [key, value] of Object.entries(parsed.meta ?? {})) {
+      this.setMeta(key, value);
+    }
+  }
+
+  /**
+   * Values are read from the database on every call rather than cached. The
+   * cache was the bug: a process that loaded an hour ago would answer with an
+   * hour-old value, and its next write would push that stale value back over
+   * whatever the guard had decided since. There is no cache to invalidate.
+   */
+  getMeta<T>(key: string): T | null {
+    const row = this.db.prepare("SELECT value FROM meta WHERE key = ?").get(key) as
+      | { value: string }
+      | undefined;
+    if (row === undefined) return null;
+    try {
+      return JSON.parse(row.value) as T;
+    } catch {
+      // A value written by an older version. Not worth failing a status read
+      // over: report it as absent.
+      return null;
+    }
+  }
+
+  setMeta(key: string, value: unknown): void {
+    this.db
+      .prepare(
+        "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+      )
+      .run(key, JSON.stringify(value));
+  }
+
+  deleteMeta(key: string): void {
+    this.db.prepare("DELETE FROM meta WHERE key = ?").run(key);
+  }
+
+  /**
+   * Keyed by timestamp, so a fleet's redundant samples of the same millisecond
+   * collapse into one row instead of stacking up. This is the whole reason the
+   * samples are a table and not an array.
+   */
+  recordSample(sample: {
+    atMs: number;
+    usedBytes: number;
+    headroomBytes: number;
+    swapUsedBytes: number;
+    compressedBytes: number;
+  }): void {
+    this.db
+      .prepare(
+        "INSERT OR IGNORE INTO samples (atMs, usedBytes, headroomBytes, swapUsedBytes, compressedBytes) VALUES (?, ?, ?, ?, ?)",
+      )
+      .run(
+        sample.atMs,
+        sample.usedBytes,
+        sample.headroomBytes,
+        sample.swapUsedBytes,
+        sample.compressedBytes,
+      );
+
+    // Retention is swept on a timer, not on every insert. The sweep costs
+    // more than the insert it would accompany, and running it per sample would
+    // mean a delete every few seconds to drop rows that are expiring once an
+    // hour.
     const now = Date.now();
     if (now - this.lastPruneMs > 600_000) {
       this.lastPruneMs = now;
-      const cutoff = now - HISTORY_RETENTION_MS;
-      this.file.samples = this.file.samples.filter((s) => s.atMs >= cutoff);
+      this.db.prepare("DELETE FROM samples WHERE atMs < ?").run(now - HISTORY_RETENTION_MS);
+      this.db
+        .prepare("DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT ?)")
+        .run(EVENT_RETENTION);
     }
-    this.scheduleFlush();
   }
 
   /**
@@ -140,11 +197,23 @@ export class Store {
    * twenty times more data than the panel can draw.
    */
   history(limit = 240): HistoryPoint[] {
-    const total = this.file.samples.length;
+    const total = (this.db.prepare("SELECT COUNT(*) AS n FROM samples").get() as { n: number }).n;
+    if (total === 0) return [];
     const stride = Math.max(1, Math.ceil(total / limit));
+    const rows = this.db
+      .prepare(
+        "SELECT atMs, usedBytes, headroomBytes, swapUsedBytes, compressedBytes FROM samples ORDER BY atMs",
+      )
+      .all() as Array<{
+      atMs: number;
+      usedBytes: number;
+      headroomBytes: number;
+      swapUsedBytes: number;
+      compressedBytes: number;
+    }>;
     const out: HistoryPoint[] = [];
-    for (let i = stride - 1; i < total; i += stride) {
-      const s = this.file.samples[i];
+    for (let i = stride - 1; i < rows.length; i += stride) {
+      const s = rows[i];
       out.push({
         atMs: s.atMs,
         usedBytes: s.usedBytes,
@@ -157,95 +226,33 @@ export class Store {
   }
 
   recordGuardEvent(event: Omit<GuardEvent, "id">): void {
-    this.file.guardEvents.push({ ...event, id: this.file.nextEventId++ });
-    if (this.file.guardEvents.length > EVENT_RETENTION) {
-      this.file.guardEvents.splice(0, this.file.guardEvents.length - EVENT_RETENTION);
-    }
-    this.scheduleFlush();
+    this.db
+      .prepare(
+        "INSERT INTO events (atMs, level, action, detail, bytesFreed, threadId) VALUES (?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        event.atMs,
+        event.level ?? null,
+        event.action,
+        event.detail,
+        event.bytesFreed,
+        event.threadId,
+      );
   }
 
   events(limit = 50): GuardEvent[] {
-    return this.file.guardEvents
-      .slice(-limit)
-      .reverse()
-      .map((e) => ({ ...e, level: e.level as PressureLevel }));
-  }
-
-  /** Stop the debouncer and persist immediately. Call on session shutdown. */
-  async flush(): Promise<void> {
-    if (this.flushTimer !== null) {
-      clearTimeout(this.flushTimer);
-      this.flushTimer = null;
-    }
-    await this.writing;
-    this.writing = this.write();
-    await this.writing;
-  }
-
-  private scheduleFlush(): void {
-    if (this.flushTimer !== null) return;
-    this.flushTimer = setTimeout(() => {
-      this.flushTimer = null;
-      this.writing = this.write();
-    }, FLUSH_DEBOUNCE_MS);
+    const rows = this.db
+      .prepare(
+        "SELECT id, atMs, level, action, detail, bytesFreed, threadId FROM events ORDER BY id DESC LIMIT ?",
+      )
+      .all(limit) as Array<Omit<GuardEvent, "id"> & { id: number; level: string | null }>;
+    return rows.map((e) => ({ ...e, level: e.level as PressureLevel }));
   }
 
   /**
-   * Write-via-rename so a crash mid-write never leaves a torn file.
-   *
-   * The read before it is the multi-process part. Every pi process on the
-   * machine loads this extension — sessions, sub-agents, headless children —
-   * and a blind whole-file write would let a quiet panel action discard the
-   * guard's sample history. So the on-disk copy is merged with what changed
-   * here rather than replaced: samples are append-only by timestamp, events
-   * by content, and meta is keyed so a writer only claims the keys it set.
+   * Kept for the shutdown path and the tests. A SQLite write lands with its
+   * statement, so there is nothing buffered to push — the debounce existed to
+   * spare a JSON serialize, and it left with the rest of the merge.
    */
-  private async write(): Promise<void> {
-    try {
-      await mkdir(dirname(this.path), { recursive: true });
-      const file = await this.merged();
-      const tmp = join(dirname(this.path), `.${Math.random().toString(36).slice(2)}.tmp`);
-      await writeFile(tmp, JSON.stringify(file), "utf8");
-      await rename(tmp, this.path);
-      this.file = file;
-      this.dirty.clear();
-    } catch {
-      // Read-only home or a vanished directory: in-memory state still works.
-    }
-  }
-
-  /** Our view plus anything another process wrote since we loaded. */
-  private async merged(): Promise<StoreFile> {
-    let theirs: Partial<StoreFile> | null = null;
-    try {
-      theirs = JSON.parse(await readFile(this.path, "utf8")) as Partial<StoreFile>;
-    } catch {
-      // first run, or a file we cannot parse — ours stands
-    }
-    if (theirs === null) return this.file;
-    const samples = [...(theirs.samples ?? []), ...this.file.samples]
-      .filter((s) => s.atMs >= Date.now() - HISTORY_RETENTION_MS)
-      .sort((a, b) => a.atMs - b.atMs);
-    // Ids are per-process counters, so two processes both start at 1 and
-    // dedup-by-id would throw away a live event. Identity is the event's
-    // content; ids are renumbered once the merged list is whole, which is
-    // also what makes them usable as unique keys in the file.
-    const events = [...(theirs.guardEvents ?? []), ...this.file.guardEvents]
-      .filter((e, i, all) => all.findIndex((other) => eventKey(other) === eventKey(e)) === i)
-      .sort((a, b) => a.atMs - b.atMs)
-      .slice(-EVENT_RETENTION)
-      .map((e, index) => ({ ...e, id: index + 1 }));
-    const meta: Record<string, unknown> = { ...(theirs.meta ?? {}) };
-    for (const [key, value] of this.dirty) {
-      if (value === null) delete meta[key];
-      else meta[key] = value;
-    }
-    return {
-      meta,
-      samples,
-      guardEvents: events,
-      // Events were renumbered 1..n above, so that is where the next id goes.
-      nextEventId: events.length + 1,
-    };
-  }
+  async flush(): Promise<void> {}
 }

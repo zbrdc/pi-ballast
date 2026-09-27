@@ -8,9 +8,10 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawn } from "node:child_process";
 import { Store } from "../src/lib/store.ts";
 
 /** Two stores on one path, plus a reader that only ever sees the file. */
@@ -103,4 +104,63 @@ test("event ids stay unique across processes", async () => {
     const ids = c.events(10).map((e) => e.id);
     assert.equal(new Set(ids).size, ids.length, `ids collided: ${ids.join(",")}`);
   });
+});
+
+/**
+ * Opening the database is where a whole fleet collides, and it is only
+ * observable from separate processes — two Stores in one process never contend.
+ *
+ * The ordering this pins: busy_timeout must be set before journal_mode = WAL.
+ * Switching journal mode needs an exclusive lock, and that statement does not
+ * wait on a timeout that has not been set yet, so a session that lost the race
+ * died with "database is locked" instead of retrying. Symptoms were a
+ * missing panel toggle and no guard at all, with nothing in the logs to say why.
+ */
+test("a dozen processes opening at once all survive and all writes land", async () => {
+  const WRITERS = 12;
+  const dir = mkdtempSync(join(tmpdir(), "ballast-open-race-"));
+  const dbPath = join(dir, "ballast-state.db");
+  const child = join(dir, "writer.mjs");
+  writeFileSync(
+    child,
+    `import { Store } from ${JSON.stringify(new URL("../src/lib/store.ts", import.meta.url).pathname)};
+const [path, tag] = process.argv.slice(2);
+const store = new Store(path);
+for (let i = 0; i < 4; i++) {
+  store.recordSample({ atMs: Date.now() + Number(tag), usedBytes: 1, headroomBytes: 2, swapUsedBytes: 0, compressedBytes: 0 });
+  store.setMeta(\`tag-\${tag}\`, i);
+  await store.flush();
+}
+`,
+  );
+
+  try {
+    const failures = await Promise.all(
+      Array.from({ length: WRITERS }, (_, i) =>
+        new Promise((resolve) => {
+          const proc = spawn(process.execPath, ["--experimental-strip-types", child, dbPath, String(i)], {
+            stdio: ["ignore", "ignore", "pipe"],
+          });
+          let stderr = "";
+          proc.stderr.on("data", (chunk) => {
+            stderr += chunk;
+          });
+          proc.on("exit", (code) => resolve({ code, stderr }));
+        }),
+      ),
+    );
+
+    const dead = failures.filter((f) => f.code !== 0);
+    assert.deepEqual(
+      dead.map((d) => d.stderr.split("\n").find((l) => /Error/.test(l)) ?? d.code),
+      [],
+      "no writer may die opening the database",
+    );
+
+    const reader = new Store(dbPath);
+    const tags = Array.from({ length: WRITERS }, (_, i) => `tag-${i}`).filter((t) => reader.getMeta(t) !== null);
+    assert.equal(tags.length, WRITERS, `every process's write landed (missing: ${WRITERS - tags.length})`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

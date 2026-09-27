@@ -26,6 +26,8 @@ const pressureOf = (level) => ({
     headroomBytes: 1 * 1024 ** 3,
     usedBytes: 8 * 1024 ** 3,
     totalBytes: 16 * 1024 ** 3,
+    swapUsedBytes: 0,
+    compressedBytes: 0,
     swapInRate: 0,
     swapOutRate: 0,
     compressionRatio: 1,

@@ -43,11 +43,12 @@ Everything destructive stays off by default. Escalation is the rung of record wh
 
 ## Configure
 
-`~/.pi/agent/ballast-state.json` holds state (samples, guard events) and config:
+`~/.pi/agent/ballast-state.db` holds state (samples, guard events) and config. It is a SQLite database via Node's built-in `node:sqlite` — no npm dependency. Every session, sub-agent and headless child opens the same file, so the store is what makes a fleet of agents safe rather than a source of lost writes:
+
+The `config` row holds a JSON string, so it still reads as plain JSON when you edit it (or hand it to `sqlite3`):
 
 ```json
 {
-  "config": {
     "thresholds": { "watchPercent": 75, "warnPercent": 85, "criticalPercent": 92, "minHeadroomGb": 3, "swapRateMbPerMin": 200 },
     "sampleSeconds": 10,
     "protectedPorts": "3000, 5173",
@@ -57,7 +58,6 @@ Everything destructive stays off by default. Escalation is the rung of record wh
     "throttle": "safe",
     "steer": true,
     "escalate": false
-  }
 }
 ```
 
@@ -74,7 +74,7 @@ macOS and Linux (reads `vm_stat`/`sysctl` or `/proc/meminfo`/`/proc/vmstat`).
 
 ```bash
 pnpm install --ignore-workspace
-pnpm test        # 88 tests, node --test over stripped types
+pnpm test        # 105 tests, node --test over stripped types
 pnpm typecheck   # tsc --noEmit
 ```
 

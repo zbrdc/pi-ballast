@@ -18,7 +18,7 @@ import { formatBytes } from "./lib/format";
 import { totalsByKind } from "./lib/procs";
 import { kindLabel } from "./lib/ui";
 
-const STATE_PATH = join(getAgentDir(), "ballast-state.json");
+const STATE_PATH = join(getAgentDir(), "ballast-state.db");
 
 /** The BB plugin logged to its own console; pi has none, so the guard's log
  *  feed is the store's activity trail, written via record(). */

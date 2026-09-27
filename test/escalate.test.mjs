@@ -23,6 +23,8 @@ const pressure = {
     atMs: Date.now(),
     headroomBytes: 0.8 * 1024 ** 3,
     usedBytes: 12 * 1024 ** 3,
+    swapUsedBytes: 0,
+    compressedBytes: 0,
     swapInRate: 0,
     swapOutRate: 0,
     compressionRatio: 1,
