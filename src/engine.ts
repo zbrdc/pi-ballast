@@ -1,10 +1,10 @@
 /**
  * The sampler, the snapshot cache, and the guard loop.
  *
- * Ported from the BB plugin's server wiring, minus the rungs pi has no knob
- * for (throttle, steer, escalate — see README). What remains is the same
- * two-tier shape: tier one reads memory totals for a few milliseconds, tier
- * two reads the whole process table, and only pressure buys tier two.
+ * Ported from the BB plugin's server wiring. The three rungs BB ran against
+ * its own fleet become pi-native here: throttle = reversible SIGSTOP on
+ * authorized candidates, steer = a message into the session whose project is
+ * holding the memory, escalate = a headless pi working the relief plan.
  */
 import type {
   Candidate,
@@ -23,6 +23,7 @@ import { cadenceMs, parseLines, parsePorts } from "./lib/policy";
 import { evaluatePressure } from "./lib/pressure";
 import { applyRelief, buildPlan } from "./lib/relieve";
 import { Store } from "./lib/store";
+import { formatBytes } from "./lib/format";
 
 /** Rate smoothing window, in samples. 3 = one bad reading cannot trip a swap signal. */
 const RATE_WINDOW = 3;
@@ -30,6 +31,29 @@ const RATE_WINDOW = 3;
 const SNAPSHOT_TTL_MS = 4000;
 /** Cooldown after an auto-relieve before another is attempted. */
 export const RELIEF_COOLDOWN_MS = 2 * 60_000;
+export const STEER_COOLDOWN_MS = 10 * 60_000;
+export const ESCALATION_COOLDOWN_MS = 20 * 60_000;
+
+/** Rung side effects, injectable so tests never touch real processes. */
+export interface GuardHooks {
+  stop?: (pid: number) => void;
+  cont?: (pid: number) => void;
+  sendUserMessage?: (text: string) => void;
+  spawnEscalation?: (prompt: string) => void;
+  /** Session context for the steer rung. */
+  cwd?: string;
+  mode?: string;
+}
+
+/**
+ * The production side effects. No PID-reuse check on resume: SIGCONT against
+ * a live, running process is a scheduling no-op, so the worst case of a stale
+ * meta entry is nothing happens — which is also the best case.
+ */
+const realHooks: GuardHooks = {
+  stop: (pid) => process.kill(pid, "SIGSTOP"),
+  cont: (pid) => process.kill(pid, "SIGCONT"),
+};
 
 export function defaultConfig(): Config {
   return {
@@ -45,6 +69,9 @@ export function defaultConfig(): Config {
     exemptPatterns: "",
     idleMinutes: 30,
     autoRelieve: "off",
+    throttle: "off",
+    steer: true,
+    escalate: false,
   };
 }
 
@@ -247,11 +274,157 @@ export class Engine {
   /**
    * The guard: tier one samples, tier two investigates, rungs act.
    *
-   * Only the terminate rung survives the pi port — throttle and escalate need
-   * host knobs pi does not expose, and steer needs a thread messaging API pi
-   * does not have. (Auto-relieve itself defaults to "off"; see README.)
+   * The ladder runs in BB's order: throttle (reversible pause) → steer (ask
+   * the session holding the memory) → relieve (kill) → escalate (a headless
+   * pi with the ballast tools). Each rung has its own gate and cooldown;
+   * escalate never fires the same tick relief already acted.
    */
-  async runGuard(signal: AbortSignal, log: (message: string) => void): Promise<void> {
+  /* ---------------- the rungs ---------------- */
+
+  /**
+   * Throttle: the reversible rung. BB capped fleet concurrency; pi has no
+   * concurrency knob, so we pause what the relief gate would authorize and
+   * resume it when pressure clears. Loses nothing — stopped work resumes.
+   */
+  private throttleRung(
+    config: Config,
+    level: PressureLevel,
+    plan: Plan,
+    pressure: Pressure,
+    hooks: GuardHooks,
+  ): void {
+    if (config.throttle !== "safe" || level === "watch") return;
+    const paused = this.store.getMeta<number[]>("throttle-paused");
+    if (paused !== null && paused.length > 0) return;
+    const safe = plan.candidates.filter(
+      (row) => row.action === "terminate" && row.risk === "safe",
+    );
+    if (safe.length === 0) return;
+    const pids = safe.flatMap((row) => row.pids);
+    const bytes = safe.reduce((sum, row) => sum + row.bytes, 0);
+    for (const pid of pids) {
+      try {
+        hooks.stop?.(pid);
+      } catch {
+        /* ESRCH: died between plan and signal — the next pause wave is free. */
+      }
+    }
+    this.store.setMeta("throttle-paused", pids);
+    this.store.setMeta("throttle-paused-at", Date.now());
+    this.record(
+      pressure,
+      "throttled",
+      `${pids.length} processes paused (${formatBytes(bytes)} held) — resumes when pressure clears`,
+      0,
+    );
+  }
+
+  /** Pids currently held by the throttle rung. */
+  pausedPids(): readonly number[] {
+    return this.store.getMeta<number[]>("throttle-paused") ?? [];
+  }
+
+  /** Resume whatever a previous guard (or a crashed session) left stopped. */
+  resumePaused(pressure: Pressure | null, hooks: GuardHooks = realHooks): void {
+    const paused = this.store.getMeta<number[]>("throttle-paused");
+    if (paused === null || paused.length === 0) return;
+    for (const pid of paused) {
+      try {
+        hooks.cont?.(pid);
+      } catch {
+        /* already gone */
+      }
+    }
+    this.store.deleteMeta("throttle-paused");
+    this.store.deleteMeta("throttle-paused-at");
+    if (pressure !== null) {
+      this.record(pressure, "restored", `${paused.length} processes resumed`, 0);
+    }
+  }
+
+  /**
+   * Steer: ask the session whose project is holding the memory to release
+   * it. BB messaged a thread; pi's equivalent is a message into the session.
+   * Only the session standing in the affected project speaks — everyone
+   * else's ballast stays quiet.
+   */
+  private steerRung(
+    config: Config,
+    level: PressureLevel,
+    snap: Snapshot,
+    pressure: Pressure,
+    hooks: GuardHooks,
+    state: { steered: boolean },
+  ): void {
+    if (!config.steer || level === "watch") return;
+    if (!hooks.sendUserMessage || hooks.mode !== "tui" || !hooks.cwd) return;
+    if (state.steered) return;
+    const now = Date.now();
+    const last = this.store.getMeta<number>("last-steer");
+    if (last !== null && now - last < STEER_COOLDOWN_MS) return;
+    const holding = snap.threads.find((row) => row.threadId === hooks.cwd);
+    if (!holding || holding.bytes < 256 * 1024 ** 2) return;
+    state.steered = true;
+    this.store.setMeta("last-steer", now);
+    hooks.sendUserMessage(
+      `Memory pressure is ${level} (${pressure.reason}). ` +
+        `This session's project (${holding.label}) is holding ${formatBytes(holding.bytes)}. ` +
+        "Close Playwright browsers and stop dev servers you started when they are " +
+        "no longer needed, or run /ballast.",
+    );
+    this.record(
+      pressure,
+      "steered",
+      `asked ${holding.label} (${formatBytes(holding.bytes)}) to release`,
+      0,
+    );
+  }
+
+  /**
+   * Escalate: hand the problem to a headless pi with the ballast tools.
+   * Never when there is nothing for it to do — BB's lesson: an agent whose
+   * only possible move is asking the user a question is noise at 3am. And
+   * never while a relief wave is still landing: kills are asynchronous, so
+   * the agent waits out relief's own cadence before it concludes the ladder
+   * failed. That also makes it the intervention of record when the user runs
+   * autoRelieve "off": nothing dies unattended, something reasons instead.
+   */
+  private escalateRung(
+    config: Config,
+    level: PressureLevel,
+    plan: Plan,
+    snap: Snapshot,
+    pressure: Pressure,
+    hooks: GuardHooks,
+  ): void {
+    if (!config.escalate || level !== "critical") return;
+    if (!hooks.spawnEscalation) return;
+    const now = Date.now();
+    const last = this.store.getMeta<number>("last-escalation");
+    if (last !== null && now - last < ESCALATION_COOLDOWN_MS) return;
+    const lastRelief = this.store.getMeta<number>("last-relief");
+    if (lastRelief !== null && now - lastRelief < RELIEF_COOLDOWN_MS) return;
+    const actionable = plan.candidates.some((row) => row.risk !== "protected");
+    const piHolding = snap.consumers.some(
+      (row) => row.kind === "pi" && row.bytes > 1024 ** 3,
+    );
+    if (!actionable && !piHolding) return;
+    this.store.setMeta("last-escalation", now);
+    hooks.spawnEscalation(
+      `Memory pressure is critical (${pressure.reason}). ` +
+        "Call ballast_plan, review the candidates, then ballast_relieve with dryRun first. " +
+        `Stop safe candidates; take disruptive ones only if headroom stays under ${config.thresholds.minHeadroomGb} GB. ` +
+        "Report what you stopped and what it freed.",
+    );
+    this.record(pressure, "escalated", "spawned a headless pi to work the relief plan", 0);
+  }
+
+  async runGuard(
+    signal: AbortSignal,
+    log: (message: string) => void,
+    hooks: GuardHooks = realHooks,
+  ): Promise<void> {
+    const steerState = { steered: false };
     let lastLevel = this.store.getMeta<PressureLevel>("last-level");
     let pendingLevel: PressureLevel | null = null;
     let lastReliefMs = this.store.getMeta<number>("last-relief") ?? 0;
@@ -292,9 +465,13 @@ export class Engine {
         if (level !== "ok") {
           const snap = await this.snapshot(config, 0);
           if (signal.aborted) break;
+          const { plan } = await this.makePlan(config, snap);
 
-          // The one rung: relieve. Waits for `critical` unless the user asked
-          // for aggressive. Safe candidates only, unless aggressive.
+          // The ladder, in BB's order: throttle (reversible) → steer (costs a
+          // turn) → relieve (kills) → escalate (hands the problem to an agent).
+          this.throttleRung(config, level, plan, pressure, hooks);
+          this.steerRung(config, level, snap, pressure, hooks, steerState);
+
           const now = Date.now();
           const reliefLevel = config.autoRelieve === "aggressive" ? "warn" : "critical";
           const reliefDue =
@@ -303,7 +480,6 @@ export class Engine {
             now - lastReliefMs > RELIEF_COOLDOWN_MS;
 
           if (reliefDue) {
-            const { plan } = await this.makePlan(config, snap);
             const ids = plan.candidates
               .filter(
                 (row) =>
@@ -325,6 +501,13 @@ export class Engine {
               log(`relieved ${result.bytesFreed} bytes from ${result.succeeded} trees`);
             }
           }
+
+          // Escalation is the last rung. It refuses to fire while a relief
+          // wave is still landing (checked against "last-relief" inside the
+          // rung) and never without something to do.
+          this.escalateRung(config, level, plan, snap, pressure, hooks);
+        } else {
+          this.resumePaused(pressure, hooks);
         }
       } catch (cause) {
         log(`guard: ${cause instanceof Error ? cause.message : String(cause)}`);

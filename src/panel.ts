@@ -19,6 +19,8 @@ export interface PanelState {
   plan: Plan | null;
   events: GuardEvent[];
   config: Config;
+  /** Pids currently held by the throttle rung, resumed when pressure clears. */
+  pausedPids: readonly number[];
 }
 
 /** A kill confirmation closes the loop the web UI's button did. */
@@ -140,9 +142,9 @@ export class BallastPanel implements Component {
 
   private renderHeader(width: number): void {
     const { config } = this.state;
-    const auto = `auto-relieve ${config.autoRelieve}`;
+    const rungs = `relieve ${config.autoRelieve} · throttle ${config.throttle} · steer ${config.steer ? "on" : "off"}`;
     const title = " ballast ";
-    const right = ` ${auto} — s to cycle `;
+    const right = ` ${rungs} — s to cycle `;
     const dots = Math.max(1, width - title.length - right.length);
     this.lines.push(
       this.theme.fg("accent", title) + "·".repeat(dots) + this.theme.fg("muted", right),
@@ -163,6 +165,14 @@ export class BallastPanel implements Component {
     if (s.swapUsedBytes > 0) {
       this.lines.push(
         this.theme.fg("muted", row("swap", `${formatBytes(s.swapUsedBytes)} of ${formatBytes(s.swapTotalBytes)}`)),
+      );
+    }
+    if (this.state.pausedPids.length > 0) {
+      this.lines.push(
+        this.fg(
+          "warn",
+          `  ▸ ${this.state.pausedPids.length} processes paused by throttle — resumes when pressure clears`,
+        ),
       );
     }
   }

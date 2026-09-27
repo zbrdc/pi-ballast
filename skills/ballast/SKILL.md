@@ -34,6 +34,20 @@ pages parked there since yesterday cost nothing.
 The `/ballast` command shows the same dashboard the user sees — pressure,
 consumers, projects, plan, and the guard's activity trail.
 
+## The guard's rungs
+
+A background guard also acts on its own when pressure is elevated, in this
+order: **throttle** (pauses authorized candidates with `SIGSTOP`, resumes them
+when pressure clears), **steer** (messages the session holding the memory),
+**relieve** (kills — only if `autoRelieve` is configured), **escalate** (spawns
+a headless `pi` to work the plan when critical persists).
+
+Before diagnosing a hung or stopped build as broken, check the activity trail:
+the throttle rung may have paused it, and it will resume on its own when
+pressure clears. A paused process is not a corpse — do not kill or restart it.
+An unattended `pi -p` process running ballast tools is the escalation rung at
+work, not a stray agent to clean up.
+
 ## The boundary
 
 `ballast_relieve` takes only ids that `ballast_plan` minted, and re-checks each

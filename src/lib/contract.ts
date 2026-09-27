@@ -264,6 +264,10 @@ export interface Overview {
 export const AUTO_RELIEVE = ["off", "safe", "aggressive"] as const;
 export type AutoRelieve = (typeof AUTO_RELIEVE)[number];
 
+/** The pause tier only ever touches what the relief gate would authorize. */
+export const THROTTLE_MODES = ["off", "safe"] as const;
+export type ThrottleMode = (typeof THROTTLE_MODES)[number];
+
 export interface Config {
   thresholds: Thresholds;
   sampleSeconds: number;
@@ -272,4 +276,10 @@ export interface Config {
   exemptPatterns: string;
   idleMinutes: number;
   autoRelieve: AutoRelieve;
+  /** Pause safe candidates under pressure (SIGSTOP), resume when it clears. */
+  throttle: ThrottleMode;
+  /** Ask this session (when its project holds memory) to release it. */
+  steer: boolean;
+  /** Spawn a headless pi to work the relief plan at critical. Off by default. */
+  escalate: boolean;
 }

@@ -7,6 +7,7 @@
  * same classification safety model, the same refuse-by-default relief gate.
  */
 import { join } from "node:path";
+import { spawn } from "node:child_process";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { defaultConfig, Engine } from "./engine";
@@ -27,17 +28,33 @@ export default function ballast(pi: ExtensionAPI) {
   const engine = new Engine(STATE_PATH);
   let guardAbort: AbortController | null = null;
 
-  pi.on("session_start", () => {
+  pi.on("session_start", (_event, ctx) => {
     // Do not start timers in the factory: a headless mode spawn would run the
     // guard for the lifetime of a one-shot `pi -p`. The session is the unit.
-    void engine.load();
+    // A reload fires session_start again — abort the old loop, not stack them.
+    guardAbort?.abort();
     guardAbort = new AbortController();
-    void engine.runGuard(guardAbort.signal, silentLog);
+    const signal = guardAbort.signal;
+    void engine.load().then(() =>
+      engine.runGuard(signal, silentLog, {
+        mode: ctx.mode,
+        cwd: ctx.cwd,
+        sendUserMessage: (text) => {
+          void pi.sendUserMessage(text, { deliverAs: "steer" });
+        },
+        spawnEscalation: (prompt) => {
+          const child = spawn("pi", ["-p", prompt], { detached: true, stdio: "ignore" });
+          child.unref();
+        },
+      }),
+    );
   });
 
   pi.on("session_shutdown", () => {
     guardAbort?.abort();
     guardAbort = null;
+    // Never leave the user's processes stopped behind a session that exited.
+    engine.resumePaused(null);
     void engine.flush();
   });
 
@@ -72,6 +89,7 @@ export default function ballast(pi: ExtensionAPI) {
       plan,
       events: engine.events(10),
       config,
+      pausedPids: engine.pausedPids(),
     };
   }
 
@@ -208,6 +226,7 @@ function emptyState(): PanelState {
     plan: null,
     events: [],
     config: defaultConfig(),
+    pausedPids: [],
   };
 }
 
