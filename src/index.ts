@@ -27,11 +27,16 @@ const silentLog = (_message: string): void => {};
 export default function ballast(pi: ExtensionAPI) {
   const engine = new Engine(STATE_PATH);
   let guardAbort: AbortController | null = null;
+  // An escalation worker is a guest, not a host. Its tools and its context
+  // injection still work; it just never runs the machine's guard loop.
+  const isWorker = process.env.BALLAST_CHILD === "1";
 
   pi.on("session_start", (_event, ctx) => {
     // Do not start timers in the factory: a headless mode spawn would run the
     // guard for the lifetime of a one-shot `pi -p`. The session is the unit.
     // A reload fires session_start again — abort the old loop, not stack them.
+    registerTools();
+    if (isWorker) return;
     guardAbort?.abort();
     guardAbort = new AbortController();
     const signal = guardAbort.signal;
@@ -43,7 +48,15 @@ export default function ballast(pi: ExtensionAPI) {
           void pi.sendUserMessage(text, { deliverAs: "steer" });
         },
         spawnEscalation: (prompt) => {
-          const child = spawn("pi", ["-p", prompt], { detached: true, stdio: "ignore" });
+          // BALLAST_CHILD tells the child's own extension load that it is a
+          // worker, not a session: it registers its tools but starts no guard
+          // loop. The lock already keeps the machine to one guard; this stops
+          // the child from spending a follower slot and a timer on it.
+          const child = spawn("pi", ["-p", prompt], {
+            detached: true,
+            stdio: "ignore",
+            env: { ...process.env, BALLAST_CHILD: "1" },
+          });
           child.unref();
         },
       }),
@@ -53,6 +66,7 @@ export default function ballast(pi: ExtensionAPI) {
   pi.on("session_shutdown", () => {
     guardAbort?.abort();
     guardAbort = null;
+    if (isWorker) return;
     // Never leave the user's processes stopped behind a session that exited.
     engine.resumePaused(null);
     void engine.flush();
@@ -132,7 +146,34 @@ export default function ballast(pi: ExtensionAPI) {
 
   /* ---------------- tools — the agent half ---------------- */
 
-  pi.registerTool({
+  // Registered at session_start, not here. See claim() below: pi treats a tool
+  // name owned by two extensions as a fatal load error and exits, so a name
+  // we cannot own has to never be claimed in the first place.
+  const registered = new Set<string>();
+
+  /**
+   * True when this extension may register `name`.
+   *
+   * At session_start the real tool registry is finally readable — during
+   * extension load every registry method is a throwing stub — so this is the
+   * first moment the owner of a name is knowable. Losing the race is normal
+   * and not an error: another extension on the machine (the bb provider
+   * bridge ships its own ballast tools) registered first, pi's loader keeps
+   * the first owner per name, and we simply do without. The panel, the
+   * /ballast command, and the context injection are unaffected.
+   */
+  function claim(name: string): boolean {
+    // Already ours from an earlier session_start: registering again would
+    // just add a duplicate entry to the same registry.
+    if (registered.has(name)) return false;
+    if (pi.getAllTools().some((tool) => tool.name === name)) return false;
+    registered.add(name);
+    return true;
+  }
+
+  // Called from session_start, where claim() can actually read the registry.
+  function registerTools(): void {
+  if (claim("ballast_status")) pi.registerTool({
     name: "ballast_status",
     label: "Ballast status",
     description:
@@ -147,7 +188,7 @@ export default function ballast(pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  if (claim("ballast_consumers")) pi.registerTool({
     name: "ballast_consumers",
     label: "Ballast consumers",
     description:
@@ -164,7 +205,7 @@ export default function ballast(pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  if (claim("ballast_plan")) pi.registerTool({
     name: "ballast_plan",
     label: "Ballast plan",
     description:
@@ -185,7 +226,7 @@ export default function ballast(pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  if (claim("ballast_relieve")) pi.registerTool({
     name: "ballast_relieve",
     label: "Ballast relieve",
     description:
@@ -208,6 +249,7 @@ export default function ballast(pi: ExtensionAPI) {
       return { content: [{ type: "text", text: lines.join("\n") }], details: { bytesFreed: result.bytesFreed } };
     },
   });
+  }
 }
 
 /** Placeholder until the first snapshot lands — every field reads as "unknown". */

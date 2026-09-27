@@ -22,6 +22,7 @@ import { sampleMemory } from "./lib/memory";
 import { cadenceMs, parseLines, parsePorts } from "./lib/policy";
 import { evaluatePressure } from "./lib/pressure";
 import { applyRelief, buildPlan } from "./lib/relieve";
+import { acquireLock, lockPathFor, type LockHandle } from "./lib/lock";
 import { Store } from "./lib/store";
 import { formatBytes } from "./lib/format";
 
@@ -124,6 +125,7 @@ export interface Snapshot {
 
 export class Engine {
   private readonly store: Store;
+  private readonly statePath: string;
   private cursor: RateCursor | null = null;
   private lastPressure: Pressure | null = null;
   private recentSwapIn: number[] = [];
@@ -134,6 +136,7 @@ export class Engine {
 
   constructor(statePath: string) {
     this.store = new Store(statePath);
+    this.statePath = statePath;
   }
 
   load(): Promise<void> {
@@ -464,11 +467,19 @@ export class Engine {
     let lastLevel = this.store.getMeta<PressureLevel>("last-level");
     let pendingLevel: PressureLevel | null = null;
     let lastReliefMs = this.store.getMeta<number>("last-relief") ?? 0;
+    let lock: LockHandle | null = null;
 
     while (!signal.aborted) {
       let level: PressureLevel = "ok";
       try {
         const config = this.readConfig();
+
+        // One guard per machine. Losing the election is not an error: this
+        // process still samples and still serves the panel and the tools, it
+        // just does not act. It retries each iteration, so the guard survives
+        // the session that started it being closed.
+        if (lock === null) lock = await acquireLock(lockPathFor(this.statePath));
+        else await lock.touch();
 
         // Tier one: totals only. Two short-lived reads, no process table —
         // a few milliseconds. This is all a healthy machine ever pays, and it
@@ -498,7 +509,11 @@ export class Engine {
           pendingLevel = null;
         }
 
-        if (level !== "ok") {
+        // Acting is the leader's job alone. A follower still records the
+        // sample and the level change — the history and the context
+        // injection are correct on every machine — but no rung of the
+        // ladder runs, because the rungs act on machine-global state.
+        if (level !== "ok" && lock !== null) {
           const snap = await this.snapshot(config, 0);
           if (signal.aborted) break;
           const { plan } = await this.makePlan(config, snap);
@@ -551,6 +566,11 @@ export class Engine {
       const config = this.readConfig();
       await sleep(cadenceMs(config, level), signal);
     }
+
+    // Hand the machine over. Without this, closing the leader's session left
+    // the guard parked until the lock aged out three minutes later, during
+    // which no other session could act at all.
+    await lock?.release();
   }
 }
 

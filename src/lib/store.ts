@@ -35,6 +35,14 @@ interface StoreFile {
   nextEventId: number;
 }
 
+/**
+ * An event's identity, for the multi-process merge. Not its id: ids are
+ * per-process counters, so two sessions both number their first event 1 and
+ * dedup-by-id would delete one of them on write.
+ */
+const eventKey = (event: { atMs: number; action: string; detail: string }): string =>
+  `${event.atMs}:${event.action}:${event.detail}`;
+
 const EMPTY: StoreFile = { meta: {}, samples: [], guardEvents: [], nextEventId: 1 };
 
 /**
@@ -44,10 +52,17 @@ const EMPTY: StoreFile = { meta: {}, samples: [], guardEvents: [], nextEventId: 
  * samples to a crash is fine; corrupting the file with a torn write is not.
  */
 export class Store {
-  private readonly file: StoreFile = structuredClone(EMPTY);
+  private file: StoreFile = structuredClone(EMPTY);
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private writing: Promise<void> = Promise.resolve();
   private lastPruneMs = 0;
+  /**
+   * Meta keys changed since the last write, with null meaning deleted. The
+   * merge writes only these, so a process that loaded the file an hour ago
+   * cannot push its stale copy of a key over a value another process just
+   * set. Cleared once the write lands.
+   */
+  private dirty = new Map<string, unknown | null>();
 
   // Explicit field: node --experimental-strip-types (the test runner) cannot
   // parse TypeScript parameter properties.
@@ -82,11 +97,13 @@ export class Store {
 
   setMeta(key: string, value: unknown): void {
     this.file.meta[key] = value;
+    this.dirty.set(key, value);
     this.scheduleFlush();
   }
 
   deleteMeta(key: string): void {
     delete this.file.meta[key];
+    this.dirty.set(key, null);
     this.scheduleFlush();
   }
 
@@ -173,15 +190,62 @@ export class Store {
     }, FLUSH_DEBOUNCE_MS);
   }
 
-  /** Write-via-rename so a crash mid-write never leaves a torn file. */
+  /**
+   * Write-via-rename so a crash mid-write never leaves a torn file.
+   *
+   * The read before it is the multi-process part. Every pi process on the
+   * machine loads this extension — sessions, sub-agents, headless children —
+   * and a blind whole-file write would let a quiet panel action discard the
+   * guard's sample history. So the on-disk copy is merged with what changed
+   * here rather than replaced: samples are append-only by timestamp, events
+   * by content, and meta is keyed so a writer only claims the keys it set.
+   */
   private async write(): Promise<void> {
     try {
       await mkdir(dirname(this.path), { recursive: true });
+      const file = await this.merged();
       const tmp = join(dirname(this.path), `.${Math.random().toString(36).slice(2)}.tmp`);
-      await writeFile(tmp, JSON.stringify(this.file), "utf8");
+      await writeFile(tmp, JSON.stringify(file), "utf8");
       await rename(tmp, this.path);
+      this.file = file;
+      this.dirty.clear();
     } catch {
       // Read-only home or a vanished directory: in-memory state still works.
     }
+  }
+
+  /** Our view plus anything another process wrote since we loaded. */
+  private async merged(): Promise<StoreFile> {
+    let theirs: Partial<StoreFile> | null = null;
+    try {
+      theirs = JSON.parse(await readFile(this.path, "utf8")) as Partial<StoreFile>;
+    } catch {
+      // first run, or a file we cannot parse — ours stands
+    }
+    if (theirs === null) return this.file;
+    const samples = [...(theirs.samples ?? []), ...this.file.samples]
+      .filter((s) => s.atMs >= Date.now() - HISTORY_RETENTION_MS)
+      .sort((a, b) => a.atMs - b.atMs);
+    // Ids are per-process counters, so two processes both start at 1 and
+    // dedup-by-id would throw away a live event. Identity is the event's
+    // content; ids are renumbered once the merged list is whole, which is
+    // also what makes them usable as unique keys in the file.
+    const events = [...(theirs.guardEvents ?? []), ...this.file.guardEvents]
+      .filter((e, i, all) => all.findIndex((other) => eventKey(other) === eventKey(e)) === i)
+      .sort((a, b) => a.atMs - b.atMs)
+      .slice(-EVENT_RETENTION)
+      .map((e, index) => ({ ...e, id: index + 1 }));
+    const meta: Record<string, unknown> = { ...(theirs.meta ?? {}) };
+    for (const [key, value] of this.dirty) {
+      if (value === null) delete meta[key];
+      else meta[key] = value;
+    }
+    return {
+      meta,
+      samples,
+      guardEvents: events,
+      // Events were renumbered 1..n above, so that is where the next id goes.
+      nextEventId: events.length + 1,
+    };
   }
 }
