@@ -45,10 +45,6 @@ export function formatPercent(fraction: number, digits = 0): string {
   return `${(fraction * 100).toFixed(digits)}%`;
 }
 
-export function formatCount(value: number): string {
-  return value.toLocaleString("en-US");
-}
-
 /**
  * Swap and compression rates, the signals that say "this machine is thrashing"
  * rather than "this machine is full". Per minute, because per second is noise
@@ -96,18 +92,6 @@ export function formatAgo(atMs: number | null, nowMs = Date.now()): string {
   if (hours < 24) return `${hours}h ago`;
   const days = Math.round(hours / 24);
   return `${days}d ago`;
-}
-
-/**
- * Shorten a path for display without losing the tail, which is the part that
- * identifies what the row actually is.
- */
-export function shortenPath(path: string, homeDir: string | null): string {
-  if (homeDir && path === homeDir) return "~";
-  if (homeDir && path.startsWith(`${homeDir}/`)) {
-    return `~/${path.slice(homeDir.length + 1)}`;
-  }
-  return path;
 }
 
 /** Left-truncate to a budget: `…/deep/tail/segment`. */

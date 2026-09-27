@@ -74,7 +74,7 @@ macOS and Linux (reads `vm_stat`/`sysctl` or `/proc/meminfo`/`/proc/vmstat`).
 
 ```bash
 pnpm install --ignore-workspace
-pnpm test        # 105 tests, node --test over stripped types
+pnpm test        # 159 tests, node --test over stripped types
 pnpm typecheck   # tsc --noEmit
 ```
 
