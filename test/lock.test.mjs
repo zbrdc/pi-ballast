@@ -7,10 +7,55 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawn } from "node:child_process";
 import { acquireLock, lockPathFor } from "../src/lib/lock.ts";
+
+/**
+ * The election as the machine actually runs it: two processes, one lock.
+ *
+ * Every other test here fakes the other holder by writing its pid into the
+ * file. This one spawns it, because the property that matters with ten pi
+ * sessions is that exactly one of them acts, and a faked pid cannot show what
+ * a real contender does. The winner holds the lock rather than dropping it
+ * immediately, so the loser is racing a live holder and not an empty file.
+ */
+test("two processes racing for the lock produce exactly one leader", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ballast-lock-race-"));
+  const path = join(dir, "ballast-guard.lock");
+  const child = join(dir, "racer.mjs");
+  // Absolute import path: a relative one resolves against /tmp.
+  writeFileSync(
+    child,
+    `import { writeFileSync } from "node:fs";
+import { acquireLock } from ${JSON.stringify(new URL("../src/lib/lock.ts", import.meta.url).pathname)};
+const [lockPath, outPath] = process.argv.slice(2);
+const lock = await acquireLock(lockPath);
+writeFileSync(outPath, lock === null ? "follower" : "leader");
+if (lock !== null) {
+  await new Promise((resolve) => setTimeout(resolve, 800));
+  await lock.release();
+}
+`,
+  );
+
+  try {
+    const run = (index) =>
+      new Promise((resolve) => {
+        const out = join(dir, `verdict-${index}`);
+        const proc = spawn(process.execPath, ["--experimental-strip-types", child, path, out], {
+          stdio: "ignore",
+        });
+        proc.on("exit", () => resolve(readFileSync(out, "utf8")));
+      });
+    const [a, b] = await Promise.all([run(0), run(1)]);
+    assert.deepEqual([a, b].sort(), ["follower", "leader"], `exactly one leader (got ${a}, ${b})`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 const withTempLock = async (fn) => {
   const dir = mkdtempSync(join(tmpdir(), "ballast-lock-"));

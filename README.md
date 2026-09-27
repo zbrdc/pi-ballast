@@ -33,13 +33,15 @@ A `ballast` skill teaches the agent when to reach for these instead of `top`.
 A background guard samples memory and grades pressure (`watch` → `warn` → `critical`). When pressure is elevated it climbs a ladder, in order of what an action costs — each rung independently switchable, each with its own cooldown:
 
 1. **Throttle** (`throttle`) — pauses what the relief gate would authorize (`SIGSTOP`), one wave per episode; resumes automatically (`SIGCONT`) when pressure clears or the session exits. Reversible: stopped work loses nothing. Runs at `warn` and above.
-2. **Steer** (`steer`) — sends one message into the session standing in the project that holds ≥256 MB, asking it to close browsers and stop dev servers. Ten-minute cooldown; interactive sessions only.
+2. **Steer** (`steer`) — sends one message into the session standing in the project that holds ≥256 MB, asking it to close browsers and stop dev servers. Ten-minute cooldown; interactive sessions only. This is the one rung that is **not** leader-only: it acts on a session rather than on the machine, and the session holding the memory is rarely the one that won the election. The ten minutes is claimed in one SQL statement, so two sessions in the same directory can never both speak.
 3. **Relieve** (`autoRelieve`) — stops authorized candidates (`safe`, or `safe` + `disruptive` when `aggressive`) at `critical` (`warn` when `aggressive`). Two-minute cooldown. Re-derives targets from the live process table, so a recycled pid is never killed by a stale plan.
 4. **Escalate** (`escalate`) — spawns a headless `pi -p` with the ballast tools to work the relief plan when the machine is still `critical`. Never fires while a relief wave is landing or when the plan carries nothing actionable. Twenty-minute cooldown.
 
 Underneath the ladder, **context injection** runs continuously: while pressure is elevated, every model request carries a one-line live status (level, headroom, paging rate, sampled-ago) labelled as automatic rather than a user message. The transcript stays clean — pi restores it after each call — but the agent already knows the machine is tight and starts serializing builds on its own. Silent when pressure is `ok` or the reading is stale.
 
 Everything destructive stays off by default. Escalation is the rung of record when `autoRelieve` is `off`: nothing dies unattended — something reasons instead.
+
+With several pi processes on one machine, exactly one runs the guard's acting rungs. It is chosen by an exclusive lock file (`~/.pi/agent/ballast-guard.lock`) that a session takes on start and releases on exit; a crashed leader's lock is taken over at its next tick, or after three minutes if its pid was recycled. Everyone samples and serves the panel and tools either way — the followers simply do not act. Steer, above, is the deliberate exception.
 
 ## Configure
 

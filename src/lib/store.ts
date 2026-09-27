@@ -147,6 +147,32 @@ export class Store {
       .run(key, JSON.stringify(value));
   }
 
+  /**
+   * Set a cooldown, but only if the previous one has expired — decided in one
+   * statement so the database picks the winner.
+   *
+   * This exists because steer runs in every session, not just the leader: two
+   * TUI sessions standing in the same project both match the holding thread,
+   * and read-then-write let both of them see an expired cooldown and both
+   * send. The condition lives inside the upsert, so exactly one caller gets
+   * true and the rest are told no. `changes` is the verdict; there is no
+   * window between the test and the write.
+   *
+   * A missing key, or one written by an older version as something that is
+   * not a timestamp, casts to 0 and is therefore claimable — which is the
+   * right answer for a cooldown nobody set.
+   */
+  claimCooldown(key: string, now: number, windowMs: number): boolean {
+    const result = this.db
+      .prepare(
+        `INSERT INTO meta (key, value) VALUES (?, ?)
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value
+         WHERE CAST(meta.value AS INTEGER) < ?`,
+      )
+      .run(key, JSON.stringify(now), now - windowMs);
+    return result.changes > 0;
+  }
+
   deleteMeta(key: string): void {
     this.db.prepare("DELETE FROM meta WHERE key = ?").run(key);
   }

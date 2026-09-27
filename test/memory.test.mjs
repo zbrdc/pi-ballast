@@ -8,11 +8,13 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { platform } from "node:os";
 import {
   parseKernelPressure,
   parseMeminfo,
   parseSwapUsage,
   parseVmStat,
+  sampleMemory,
 } from "../src/lib/memory.ts";
 
 const VM_STAT = `Mach Virtual Memory Statistics: (page size of 16384 bytes)
@@ -77,4 +79,48 @@ Cached:          2097152 kB
 `);
   assert.equal(info.get("memtotal"), 16384000 * 1024);
   assert.equal(info.get("memavailable"), 4194304 * 1024);
+});
+
+/**
+ * The live sampler, against this machine's own /proc.
+ *
+ * The parsers above are pinned to recorded output. This runs the real
+ * function, so the assertions are about the numbers agreeing with each other
+ * rather than about any particular value — the machine's state is whatever it
+ * happens to be. Skipped on macOS, where the same call shells out to vm_stat
+ * and would need a recorded fixture rather than a live read; the darwin
+ * sampler's ceiling is stated rather than papered over.
+ */
+const onLinux = platform() === "linux";
+const skip = onLinux ? false : "the live sampler is only readable on linux";
+
+test("the live reading is internally consistent", { skip }, async () => {
+  const { sample, cursor } = await sampleMemory(null);
+  assert.ok(sample.totalBytes > 0, "the machine has memory");
+  assert.ok(sample.usedBytes > 0 && sample.usedBytes <= sample.totalBytes, "used is inside total");
+  assert.ok(sample.headroomBytes > 0, "something is available");
+  assert.ok(sample.headroomBytes <= sample.totalBytes, "headroom is inside total");
+  assert.ok(sample.swapUsedBytes <= sample.swapTotalBytes, "swap used is inside swap total");
+  assert.equal(cursor.pageSize, 4096, "linux pages are 4 KiB");
+  assert.equal(sample.swapInRate, 0, "a first sample has no interval to report a rate over");
+  assert.equal(sample.compressionRatio, 1, "no compressor to grade");
+});
+
+test("a second sample turns the counters into rates, never negatives", { skip }, async () => {
+  const first = await sampleMemory(null);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const { sample } = await sampleMemory(first.cursor);
+  assert.ok(Number.isFinite(sample.swapInRate), "a finite rate");
+  assert.ok(sample.swapInRate >= 0 && sample.swapOutRate >= 0, "never negative");
+});
+
+/** A cursor from the future must produce silence, not a spike. */
+test("a counter that went backwards reports nothing", { skip }, async () => {
+  const { cursor } = await sampleMemory(null);
+  const { sample } = await sampleMemory({
+    ...cursor,
+    atMs: cursor.atMs + 60_000,
+    swapInPages: cursor.swapInPages + 9999,
+  });
+  assert.equal(sample.swapInRate, 0, "an impossible interval yields no rate");
 });

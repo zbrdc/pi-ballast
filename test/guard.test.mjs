@@ -11,7 +11,9 @@ import { test } from "node:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { writeFileSync } from "node:fs";
 import { Engine, defaultConfig } from "../src/engine.ts";
+import { lockPathFor } from "../src/lib/lock.ts";
 import { DEFAULT_THRESHOLDS } from "../src/lib/pressure.ts";
 
 const PROJECT = "/home/dan/git/hold";
@@ -110,6 +112,12 @@ const harness = async (over = {}) => {
     autoRelieve: "safe",
     ...(over.config ?? {}),
   });
+  // A foreign live holder makes this session a follower for the whole test:
+  // acquireLock refuses it, exactly as it would with another pi session's
+  // guard holding the machine. process.ppid is alive and is not us.
+  if (over.follower) {
+    writeFileSync(lockPathFor(join(dir, "state.json")), JSON.stringify({ pid: process.ppid }));
+  }
   return { dir, engine, order, hooks };
 };
 
@@ -183,6 +191,71 @@ test("a paused set from a previous session blocks a new pause wave but not the r
     assert.ok(!kinds.includes("throttle"), "no second wave");
     assert.ok(kinds.includes("steer"), "steer still runs");
     assert.deepEqual(h.engine.store.getMeta("throttle-paused"), [999], "old set untouched");
+  } finally {
+    await cleanup(h.dir);
+  }
+});
+
+test("a follower steers: the holding session speaks without leading", async () => {
+  const h = await harness({ follower: true });
+  try {
+    await drive(h.engine, ["critical", "critical"], h.hooks);
+    const kinds = h.order.map(([k]) => k);
+    assert.deepEqual(kinds, ["steer"], "steer is the only rung a follower runs");
+    assert.equal(
+      h.engine.events(10).some((e) => e.action === "steered"),
+      true,
+      "and it is on the record",
+    );
+  } finally {
+    await cleanup(h.dir);
+  }
+});
+
+test("a follower holds no machine rungs at all", async () => {
+  const h = await harness({ follower: true });
+  try {
+    await drive(h.engine, ["critical", "critical"], h.hooks);
+    const actions = h.engine.events(10).map((e) => e.action);
+    for (const forbidden of ["throttled", "relieved", "escalated"]) {
+      assert.ok(!actions.includes(forbidden), `a follower must not ${forbidden}`);
+    }
+    assert.equal(h.engine.store.getMeta("throttle-paused"), null, "and touches no machine state");
+  } finally {
+    await cleanup(h.dir);
+  }
+});
+
+/**
+ * The resume bug this gate split exposed.
+ *
+ * The old gate was "under pressure AND leader", so every other branch was
+ * "resume what the throttle held" — which meant a follower under pressure
+ * resumed the leader's pause wave one tick after it started, and with ten
+ * sessions running that was a matter of seconds. Resume belongs to ok alone.
+ */
+test("a follower under pressure never resumes the leader's pause", async () => {
+  const h = await harness({ follower: true });
+  try {
+    h.engine.store.setMeta("throttle-paused", [4242]);
+    await drive(h.engine, ["critical", "critical"], h.hooks);
+    assert.ok(
+      !h.order.some(([k]) => k === "resume"),
+      "pressure never cleared, so nothing is resumed",
+    );
+    assert.deepEqual(h.engine.store.getMeta("throttle-paused"), [4242], "the leader's wave is intact");
+  } finally {
+    await cleanup(h.dir);
+  }
+});
+
+test("the leader resumes on ok, and only then", async () => {
+  const h = await harness();
+  try {
+    h.engine.store.setMeta("throttle-paused", [4242]);
+    await drive(h.engine, ["ok", "ok"], h.hooks);
+    assert.ok(h.order.some(([k]) => k === "resume"), "clear pressure restores the paused");
+    assert.equal(h.engine.store.getMeta("throttle-paused"), null, "pause cleared");
   } finally {
     await cleanup(h.dir);
   }

@@ -42,6 +42,11 @@ when pressure clears), **steer** (messages the session holding the memory),
 **relieve** (kills — only if `autoRelieve` is configured), **escalate** (spawns
 a headless `pi` to work the plan when critical persists).
 
+On a machine running several pi processes, one session runs the acting rungs
+and the rest only sample and report — except steer, which the session holding
+the memory runs for itself. A steer message you see is therefore always about
+your own project, never about someone else's.
+
 Alongside the rungs, live memory status is injected into the model's context
 while pressure is elevated — a labelled one-liner, restored out of the
 transcript after each request. If a user turn seems to be preceded by a note

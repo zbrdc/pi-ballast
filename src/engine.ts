@@ -386,6 +386,13 @@ export class Engine {
    * it. BB messaged a thread; pi's equivalent is a message into the session.
    * Only the session standing in the affected project speaks — everyone
    * else's ballast stays quiet.
+   *
+   * This is the one rung that runs outside the leader gate, because it acts
+   * on a session rather than on the machine: the only process that can
+   * deliver the message is the TUI session holding the memory, and that may
+   * not be the leader. Every other rung acts on machine-global state, where a
+   * second writer is the failure this plugin exists to avoid, so those stay
+   * leader-only.
    */
   private steerRung(
     config: Config,
@@ -398,13 +405,13 @@ export class Engine {
     if (!config.steer || level === "watch") return;
     if (!hooks.sendUserMessage || hooks.mode !== "tui" || !hooks.cwd) return;
     if (state.steered) return;
-    const now = Date.now();
-    const last = this.store.getMeta<number>("last-steer");
-    if (last !== null && now - last < STEER_COOLDOWN_MS) return;
     const holding = snap.threads.find((row) => row.threadId === hooks.cwd);
     if (!holding || holding.bytes < 256 * 1024 ** 2) return;
+    // Claim the cooldown before speaking, not after: sessions are no longer
+    // serialised by the leader lock, so two of them standing in the same
+    // project reach this line together. The store decides, in one statement.
+    if (!this.store.claimCooldown("last-steer", Date.now(), STEER_COOLDOWN_MS)) return;
     state.steered = true;
-    this.store.setMeta("last-steer", now);
     hooks.sendUserMessage(
       `Memory pressure is ${level} (${pressure.reason}). ` +
         `This session's project (${holding.label}) is holding ${formatBytes(holding.bytes)}. ` +
@@ -458,6 +465,83 @@ export class Engine {
     this.record(pressure, "escalated", "spawned a headless pi to work the relief plan", 0);
   }
 
+  /**
+   * Whether this session could deliver a steer message — decided without
+   * touching the process table.
+   *
+   * The rung behind it needs a snapshot, and a snapshot reads every process on
+   * the machine. So the cheap refusals come first: only a TUI session in a
+   * real directory can hold memory, which is also the only place a message
+   * can be delivered. At warn or worse that session might be the one holding
+   * it, so it pays for the read; a sub-agent or a headless child never does.
+   */
+  private canSteer(config: Config, level: PressureLevel, hooks: GuardHooks): boolean {
+    if (!config.steer || level === "watch") return false;
+    return hooks.sendUserMessage !== undefined && hooks.mode === "tui" && Boolean(hooks.cwd);
+  }
+
+  /**
+   * The irreversible rungs, in BB's order: relieve (kills) → escalate (hands
+   * the problem to an agent).
+   *
+   * Leader-only, like throttle: both act on machine-global state, where a
+   * second writer is the failure this plugin exists to prevent. Steer is not
+   * in here — it acts on a session, so it belongs to whichever session can
+   * deliver it rather than to whoever won the election. The caller runs
+   * throttle and steer around this one to keep BB's order intact.
+   */
+  private async irreversibleRungs({
+    config,
+    level,
+    plan,
+    snap,
+    pressure,
+    hooks,
+    log,
+  }: {
+    config: Config;
+    level: PressureLevel;
+    plan: Plan;
+    snap: Snapshot;
+    pressure: Pressure;
+    hooks: GuardHooks;
+    log: (message: string) => void;
+  }): Promise<void> {
+    const now = Date.now();
+    const lastReliefMs = this.store.getMeta<number>("last-relief") ?? 0;
+    const reliefLevel = config.autoRelieve === "aggressive" ? "warn" : "critical";
+    if (
+      config.autoRelieve !== "off" &&
+      level === reliefLevel &&
+      now - lastReliefMs > RELIEF_COOLDOWN_MS
+    ) {
+      const ids = plan.candidates
+        .filter(
+          (row) =>
+            row.action === "terminate" &&
+            (row.risk === "safe" ||
+              (config.autoRelieve === "aggressive" && row.risk === "disruptive")),
+        )
+        .map((row) => row.id);
+      if (ids.length > 0) {
+        this.store.setMeta("last-relief", now);
+        const result = await this.runRelief(config, ids, false);
+        this.record(
+          pressure,
+          result.bytesFreed > 0 ? "relieved" : "suppressed",
+          `${result.succeeded} stopped, ${result.failed} refused — ${result.bytesFreed} bytes released`,
+          result.bytesFreed,
+        );
+        log(`relieved ${result.bytesFreed} bytes from ${result.succeeded} trees`);
+      }
+    }
+
+    // Escalation is the last rung. It refuses to fire while a relief wave is
+    // still landing (checked against "last-relief" above and again inside the
+    // rung) and never without something to do.
+    this.escalateRung(config, level, plan, snap, pressure, hooks);
+  }
+
   async runGuard(
     signal: AbortSignal,
     log: (message: string) => void,
@@ -466,7 +550,6 @@ export class Engine {
     const steerState = { steered: false };
     let lastLevel = this.store.getMeta<PressureLevel>("last-level");
     let pendingLevel: PressureLevel | null = null;
-    let lastReliefMs = this.store.getMeta<number>("last-relief") ?? 0;
     let lock: LockHandle | null = null;
 
     while (!signal.aborted) {
@@ -509,56 +592,41 @@ export class Engine {
           pendingLevel = null;
         }
 
-        // Acting is the leader's job alone. A follower still records the
-        // sample and the level change — the history and the context
-        // injection are correct on every machine — but no rung of the
-        // ladder runs, because the rungs act on machine-global state.
-        if (level !== "ok" && lock !== null) {
-          const snap = await this.snapshot(config, 0);
-          if (signal.aborted) break;
-          const { plan } = await this.makePlan(config, snap);
+        if (level === "ok") {
+          // Nothing is under pressure, so whatever the throttle rung held goes
+          // back. Only on ok: the old gate was "not ok AND leader", so a
+          // follower under pressure fell into this branch and resumed the
+          // leader's wave a tick after it started, with ten sessions running
+          // that was a matter of seconds.
+          this.resumePaused(pressure, hooks);
+        } else {
+          // BB's order across two different gates: throttle (leader) runs
+          // before steer (any session), which runs before relief and
+          // escalation (leader). Throttle is reversible and free, so the
+          // machine holds less memory before anyone is asked to act.
+          //
+          // One snapshot serves all three. The cheap gate is which rungs can
+          // run at all, not how many times the process table is read: a
+          // follower that cannot steer never looks, and the leader reads
+          // once however many of its rungs fire.
+          const leads = lock !== null;
+          const steers = this.canSteer(config, level, hooks);
+          if (leads || steers) {
+            const snap = await this.snapshot(config, 0);
+            if (signal.aborted) break;
+            // The plan only matters to the rungs that act on the machine, so
+            // a follower steering alone does not pay for it. A non-null plan
+            // is also the proof this session leads.
+            const plan: Plan | null = leads
+              ? (await this.makePlan(config, snap)).plan
+              : null;
 
-          // The ladder, in BB's order: throttle (reversible) → steer (costs a
-          // turn) → relieve (kills) → escalate (hands the problem to an agent).
-          this.throttleRung(config, level, plan, pressure, hooks);
-          this.steerRung(config, level, snap, pressure, hooks, steerState);
-
-          const now = Date.now();
-          const reliefLevel = config.autoRelieve === "aggressive" ? "warn" : "critical";
-          const reliefDue =
-            config.autoRelieve !== "off" &&
-            level === reliefLevel &&
-            now - lastReliefMs > RELIEF_COOLDOWN_MS;
-
-          if (reliefDue) {
-            const ids = plan.candidates
-              .filter(
-                (row) =>
-                  row.action === "terminate" &&
-                  (row.risk === "safe" ||
-                    (config.autoRelieve === "aggressive" && row.risk === "disruptive")),
-              )
-              .map((row) => row.id);
-            if (ids.length > 0) {
-              lastReliefMs = now;
-              this.store.setMeta("last-relief", now);
-              const result = await this.runRelief(config, ids, false);
-              this.record(
-                pressure,
-                result.bytesFreed > 0 ? "relieved" : "suppressed",
-                `${result.succeeded} stopped, ${result.failed} refused — ${result.bytesFreed} bytes released`,
-                result.bytesFreed,
-              );
-              log(`relieved ${result.bytesFreed} bytes from ${result.succeeded} trees`);
+            if (plan !== null) this.throttleRung(config, level, plan, pressure, hooks);
+            if (steers) this.steerRung(config, level, snap, pressure, hooks, steerState);
+            if (plan !== null) {
+              await this.irreversibleRungs({ config, level, plan, snap, pressure, hooks, log });
             }
           }
-
-          // Escalation is the last rung. It refuses to fire while a relief
-          // wave is still landing (checked against "last-relief" inside the
-          // rung) and never without something to do.
-          this.escalateRung(config, level, plan, snap, pressure, hooks);
-        } else {
-          this.resumePaused(pressure, hooks);
         }
       } catch (cause) {
         log(`guard: ${cause instanceof Error ? cause.message : String(cause)}`);

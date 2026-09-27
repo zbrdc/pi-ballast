@@ -107,6 +107,61 @@ test("event ids stay unique across processes", async () => {
 });
 
 /**
+ * The steer cooldown, claimed rather than checked.
+ *
+ * Steer runs in every session, not only the leader, because only the session
+ * standing in the project holding the memory can deliver the message. Two TUI
+ * sessions in the same directory therefore reach the cooldown together, and
+ * read-then-write let both of them see it expired and both speak — two
+ * "please close your browsers" messages to the same person. The condition
+ * lives inside the upsert so the database picks exactly one winner.
+ *
+ * Separate processes, because that is the only place two Stores contend.
+ */
+test("a dozen processes racing one cooldown produce exactly one winner", async () => {
+  const RACERS = 12;
+  const dir = mkdtempSync(join(tmpdir(), "ballast-cooldown-race-"));
+  const dbPath = join(dir, "ballast-state.db");
+  const child = join(dir, "claimer.mjs");
+  writeFileSync(
+    child,
+    `import { Store } from ${JSON.stringify(new URL("../src/lib/store.ts", import.meta.url).pathname)};
+const [path] = process.argv.slice(2);
+const store = new Store(path);
+const won = store.claimCooldown("last-steer", Date.now(), 600_000);
+process.stdout.write(won ? "WON" : "lost");
+`,
+  );
+
+  try {
+    // Seeded once, here. A racer that reset the key before claiming would
+    // clobber a winner's claim and let the next one in — which is exactly the
+    // bug the claim exists to stop, so the fixture must not contain it.
+    new Store(dbPath).setMeta("last-steer", Date.now() - 60 * 60_000);
+
+    const outcomes = await Promise.all(
+      Array.from({ length: RACERS }, () =>
+        new Promise((resolve) => {
+          const proc = spawn(process.execPath, ["--experimental-strip-types", child, dbPath], {
+            stdio: ["ignore", "pipe", "ignore"],
+          });
+          let out = "";
+          proc.stdout.on("data", (chunk) => {
+            out += chunk;
+          });
+          proc.on("exit", () => resolve(out.trim()));
+        }),
+      ),
+    );
+    const winners = outcomes.filter((o) => o === "WON").length;
+    assert.equal(winners, 1, `exactly one session may speak (got ${winners}: ${outcomes.join(",")})`);
+    assert.equal(outcomes.filter((o) => o === "lost").length, RACERS - 1, "everyone else is told no");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/**
  * Opening the database is where a whole fleet collides, and it is only
  * observable from separate processes — two Stores in one process never contend.
  *
