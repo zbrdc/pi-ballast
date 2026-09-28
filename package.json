@@ -1,6 +1,6 @@
 {
   "name": "pi-ballast",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "description": "Physical memory pressure for pi — TUI stats, per-project attribution, and a graded intervention ladder.",
   "license": "MIT",
   "type": "module",
