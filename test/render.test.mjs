@@ -56,7 +56,7 @@ const consumer = (over = {}) => ({
   pids: [10, 11, 12],
   ageSeconds: 3600,
   cpuPercent: 0,
-  threadId: "/home/dan/git/hold",
+  threadId: "/home/dev/git/hold",
   threadTitle: "hold",
   port: 3000,
   ...over,
@@ -172,7 +172,7 @@ test("an unattributed process shows no project rather than an empty bracket", ()
 });
 
 test("a long project name is truncated and the row stays one line", () => {
-  const long = "/home/dan/git/some/deeply/nested/project/that/never/ends";
+  const long = "/home/dev/git/some/deeply/nested/project/that/never/ends";
   const lines = renderConsumers("Projects", [consumer({ threadTitle: long })]).split("\n");
   assert.equal(lines.length, 2, "a wrapped row would need a second line");
   assert.ok(lines[1].includes("…"), "ellipsized, not printed whole");

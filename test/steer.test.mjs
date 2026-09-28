@@ -13,7 +13,7 @@ import { join } from "node:path";
 import { Engine, defaultConfig } from "../src/engine.ts";
 import { DEFAULT_THRESHOLDS } from "../src/lib/pressure.ts";
 
-const PROJECT = "/home/dan/git/hold";
+const PROJECT = "/home/dev/git/hold";
 
 const pressure = {
   level: "warn",
@@ -109,7 +109,7 @@ test("watch stays silent", async () => {
 });
 
 test("a session outside the holding project is never messaged", async () => {
-  const h = await harness({ hooks: { cwd: "/home/dan/git/somewhere-else" } });
+  const h = await harness({ hooks: { cwd: "/home/dev/git/somewhere-else" } });
   try {
     h.engine.steerRung(h.config, "warn", snapOf([threadConsumer()]), pressure, h.hooks, { steered: false });
     assert.equal(h.sent.length, 0, "unrelated sessions keep quiet");

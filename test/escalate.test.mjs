@@ -73,7 +73,7 @@ const harness = async (over = {}) => {
   const spawned = [];
   const hooks = {
     mode: "tui",
-    cwd: "/home/dan/git/x",
+    cwd: "/home/dev/git/x",
     spawnEscalation: (prompt) => spawned.push(prompt),
     ...over.hooks,
   };

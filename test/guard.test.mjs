@@ -16,7 +16,7 @@ import { Engine, defaultConfig } from "../src/engine.ts";
 import { lockPathFor } from "../src/lib/lock.ts";
 import { DEFAULT_THRESHOLDS } from "../src/lib/pressure.ts";
 
-const PROJECT = "/home/dan/git/hold";
+const PROJECT = "/home/dev/git/hold";
 
 const pressureOf = (level) => ({
   level,

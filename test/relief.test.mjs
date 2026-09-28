@@ -152,7 +152,7 @@ test("a steer candidate with no thread cannot be steered", async () => {
 
 test("a steer candidate reaches its thread and reports success", async () => {
   const sent = [];
-  const result = await dry([candidate({ action: "steer", threadId: "/home/dan/git/hold" })], {
+  const result = await dry([candidate({ action: "steer", threadId: "/home/dev/git/hold" })], {
     dryRun: false,
     steer: async (threadId, message) => {
       sent.push([threadId, message]);
@@ -160,7 +160,7 @@ test("a steer candidate reaches its thread and reports success", async () => {
   });
   assert.equal(result.items[0].detail, "steered");
   assert.equal(sent.length, 1);
-  assert.equal(sent[0][0], "/home/dan/git/hold");
+  assert.equal(sent[0][0], "/home/dev/git/hold");
   assert.match(sent[0][1], /under memory pressure/);
   assert.match(sent[0][1], /Do not stop work/, "it asks, it does not order");
 });

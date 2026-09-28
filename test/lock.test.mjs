@@ -149,5 +149,5 @@ test("release twice is safe, and touch does not throw", async () => {
 });
 
 test("lockPathFor sits beside the state file", () => {
-  assert.equal(lockPathFor("/home/dan/.pi/agent/ballast-state.json"), "/home/dan/.pi/agent/ballast-guard.lock");
+  assert.equal(lockPathFor("/home/dev/.pi/agent/ballast-state.json"), "/home/dev/.pi/agent/ballast-guard.lock");
 });

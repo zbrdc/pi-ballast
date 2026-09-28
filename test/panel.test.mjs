@@ -11,7 +11,7 @@ import { defaultConfig } from "../src/engine.ts";
 import { DEFAULT_THRESHOLDS } from "../src/lib/pressure.ts";
 
 /** A project directory, so attribution has something to attribute to. */
-const PROJECT = "/home/dan/git/hold";
+const PROJECT = "/home/dev/git/hold";
 
 const pressure = {
   level: "warn",

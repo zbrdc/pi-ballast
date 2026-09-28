@@ -103,8 +103,8 @@ test("a mixed tree is captioned with no thread rather than an arbitrary one", ()
   // answer would be a guess. The row says nothing instead.
   const rows = [
     row({ pid: 10, kind: "dev-server", rssBytes: 100 * MB, threadId: null }),
-    row({ pid: 11, ppid: 10, kind: "dev-server", rssBytes: 100 * MB, threadId: "/home/dan/git/a" }),
-    row({ pid: 12, ppid: 10, kind: "dev-server", rssBytes: 100 * MB, threadId: "/home/dan/git/b" }),
+    row({ pid: 11, ppid: 10, kind: "dev-server", rssBytes: 100 * MB, threadId: "/home/dev/git/a" }),
+    row({ pid: 12, ppid: 10, kind: "dev-server", rssBytes: 100 * MB, threadId: "/home/dev/git/b" }),
   ];
   const [group] = groupConsumers(rows, titles);
   assert.equal(group.threadId, null, "no thread, not the first one found");
@@ -113,11 +113,11 @@ test("a mixed tree is captioned with no thread rather than an arbitrary one", ()
 
 test("a tree whose members agree carries that thread", () => {
   const rows = [
-    row({ pid: 10, kind: "dev-server", rssBytes: 100 * MB, threadId: "/home/dan/git/hold" }),
-    row({ pid: 11, ppid: 10, kind: "dev-server", rssBytes: 100 * MB, threadId: "/home/dan/git/hold" }),
+    row({ pid: 10, kind: "dev-server", rssBytes: 100 * MB, threadId: "/home/dev/git/hold" }),
+    row({ pid: 11, ppid: 10, kind: "dev-server", rssBytes: 100 * MB, threadId: "/home/dev/git/hold" }),
   ];
   const [group] = groupConsumers(rows, titles, { minBytes: 1 });
-  assert.equal(group.threadId, "/home/dan/git/hold");
+  assert.equal(group.threadId, "/home/dev/git/hold");
 });
 
 test("a parent cycle does not hang the grouping", () => {
@@ -167,11 +167,11 @@ test("a project's processes sum into one row named for the project", () => {
   // This is the view that makes an intervention actionable: "node holds 3 GB"
   // is useless, "hold holds 3 GB across 2 processes" names a session.
   const rows = [
-    consumer({ id: "pid:10", bytes: 2 * 1024 ** 3, pids: [10], rootPid: 10, threadId: "/home/dan/git/hold" }),
-    consumer({ id: "pid:11", bytes: 1024 ** 3, pids: [11], rootPid: 11, threadId: "/home/dan/git/hold" }),
-    consumer({ id: "pid:12", bytes: 10 * MB, pids: [12], rootPid: 12, threadId: "/home/dan/git/other" }),
+    consumer({ id: "pid:10", bytes: 2 * 1024 ** 3, pids: [10], rootPid: 10, threadId: "/home/dev/git/hold" }),
+    consumer({ id: "pid:11", bytes: 1024 ** 3, pids: [11], rootPid: 11, threadId: "/home/dev/git/hold" }),
+    consumer({ id: "pid:12", bytes: 10 * MB, pids: [12], rootPid: 12, threadId: "/home/dev/git/other" }),
   ];
-  const grouped = groupByThread(rows, new Map([["/home/dan/git/hold", "hold"]]));
+  const grouped = groupByThread(rows, new Map([["/home/dev/git/hold", "hold"]]));
   assert.equal(grouped.length, 2);
   assert.equal(grouped[0].label, "hold", "the title, not the raw path");
   assert.equal(grouped[0].bytes, 3 * 1024 ** 3);
@@ -185,9 +185,9 @@ test("an unattributed process is dropped, not filed under nowhere", () => {
 });
 
 test("an unknown thread falls back to its path rather than blank", () => {
-  const [group] = groupByThread([consumer({ threadId: "/home/dan/git/mystery" })], titles);
-  assert.equal(group.label, "/home/dan/git/mystery");
-  assert.equal(group.threadTitle, "/home/dan/git/mystery");
+  const [group] = groupByThread([consumer({ threadId: "/home/dev/git/mystery" })], titles);
+  assert.equal(group.label, "/home/dev/git/mystery");
+  assert.equal(group.threadTitle, "/home/dev/git/mystery");
 });
 
 test("the oldest process decides the row's age and any port is kept", () => {
@@ -230,10 +230,10 @@ test("a child inherits its project from the pi process it descends from", () => 
     row({ pid: 11, ppid: 10, kind: "dev-server", rssBytes: 100 * MB }),
     row({ pid: 12, ppid: 11, kind: "dev-server", rssBytes: 100 * MB, command: "node worker" }),
   ];
-  const attributed = attributeByPiCwd(rows, new Map([[10, "/home/dan/git/hold"]]));
+  const attributed = attributeByPiCwd(rows, new Map([[10, "/home/dev/git/hold"]]));
   assert.deepEqual(
     attributed.map((r) => r.threadId),
-    ["/home/dan/git/hold", "/home/dan/git/hold", "/home/dan/git/hold"],
+    ["/home/dev/git/hold", "/home/dev/git/hold", "/home/dev/git/hold"],
   );
 });
 
@@ -247,7 +247,7 @@ test("an already-attributed row is not overwritten", () => {
     row({ pid: 10, kind: "pi", name: "pi", ppid: 1, threadId: null }),
     row({ pid: 11, ppid: 10, kind: "dev-server", threadId: "/already/known" }),
   ];
-  const attributed = attributeByPiCwd(rows, new Map([[10, "/home/dan/git/hold"]]));
+  const attributed = attributeByPiCwd(rows, new Map([[10, "/home/dev/git/hold"]]));
   assert.equal(attributed[1].threadId, "/already/known");
 });
 
