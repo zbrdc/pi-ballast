@@ -128,14 +128,14 @@ test("relief due: throttle, steer, and relief run — escalation holds its breat
   try {
     await drive(h.engine, ["critical", "critical"], h.hooks);
     const kinds = h.order.map(([k]) => k);
-    assert.deepEqual(kinds, ["throttle", "steer"], "throttle precedes steer");
+    assert.deepEqual(kinds, ["throttle", "steer", "resume"], "throttle precedes steer; shutdown restores it");
     // relief is recorded via events, not hooks — prove it ran and escalate did not
     const actions = h.engine.events(10).map((e) => e.action);
     assert.ok(actions.includes("throttled"), "throttle rung ran");
     assert.ok(actions.includes("steered"), "steer rung ran");
     assert.ok(actions.includes("relieved"), "relief rung ran");
     assert.ok(!kinds.includes("escalate"), "no escalation the same tick relief acted");
-    assert.deepEqual(h.engine.store.getMeta("throttle-paused"), [100], "pause held");
+    assert.equal(h.engine.store.getMeta("throttle-paused"), null, "shutdown resumed and cleared the pause");
   } finally {
     await cleanup(h.dir);
   }
@@ -146,7 +146,7 @@ test("relief configured out: throttle, steer, escalate — no kill", async () =>
   try {
     await drive(h.engine, ["critical", "critical"], h.hooks);
     const kinds = h.order.map(([k]) => k);
-    assert.deepEqual(kinds, ["throttle", "steer", "escalate"], "ladder order, escalate in relief's slot");
+    assert.deepEqual(kinds, ["throttle", "steer", "escalate", "resume"], "ladder order, then shutdown cleanup");
     const actions = h.engine.events(10).map((e) => e.action);
     assert.ok(!actions.includes("relieved"), "relief is configured out");
     assert.ok(actions.includes("escalated"), "escalation took over");
@@ -162,7 +162,7 @@ test("a relief that just ran keeps escalation waiting out its cadence", async ()
     await drive(h.engine, ["critical", "critical"], h.hooks);
     const kinds = h.order.map(([k]) => k);
     assert.ok(!kinds.includes("escalate"), "no agent while kills may still be landing");
-    assert.ok(!kinds.includes("resume"), "pressure never cleared");
+    assert.ok(kinds.includes("resume"), "shutdown still cleans up the pause");
   } finally {
     await cleanup(h.dir);
   }
@@ -190,7 +190,8 @@ test("a paused set from a previous session blocks a new pause wave but not the r
     const kinds = h.order.map(([k]) => k);
     assert.ok(!kinds.includes("throttle"), "no second wave");
     assert.ok(kinds.includes("steer"), "steer still runs");
-    assert.deepEqual(h.engine.store.getMeta("throttle-paused"), [999], "old set untouched");
+    assert.ok(kinds.includes("resume"), "shutdown cleans up the old wave");
+    assert.equal(h.engine.store.getMeta("throttle-paused"), null, "old set is cleared after resume");
   } finally {
     await cleanup(h.dir);
   }
@@ -261,14 +262,41 @@ test("the leader resumes on ok, and only then", async () => {
   }
 });
 
+test("a follower at ok still does not resume the leader's pause", async () => {
+  // Leadership gates machine actions even when the follower's own sample
+  // says healthy. Only the elected process owns the pause-set lifecycle.
+  const h = await harness({ follower: true });
+  try {
+    h.engine.store.setMeta("throttle-paused", [4242]);
+    await drive(h.engine, ["ok", "ok"], h.hooks);
+    assert.ok(!h.order.some(([k]) => k === "resume"), "the follower leaves it alone");
+    assert.deepEqual(h.engine.store.getMeta("throttle-paused"), [4242]);
+  } finally {
+    await cleanup(h.dir);
+  }
+});
+
+test("leader shutdown resumes its pause before releasing the lock", async () => {
+  const h = await harness();
+  try {
+    await drive(h.engine, ["critical", "critical"], h.hooks);
+    assert.ok(h.order.some(([k]) => k === "throttle"), "the leader paused a candidate");
+    assert.ok(h.order.some(([k]) => k === "resume"), "shutdown cleanup resumed it");
+    assert.equal(h.engine.store.getMeta("throttle-paused"), null);
+  } finally {
+    await cleanup(h.dir);
+  }
+});
+
 test("warn engages throttle and steer but never relief or escalation", async () => {
   const h = await harness();
   try {
     await drive(h.engine, ["warn", "warn"], h.hooks);
     const kinds = h.order.map(([k]) => k);
-    assert.deepEqual(kinds, ["throttle", "steer"], "warn is the reversible band");
+    assert.deepEqual(kinds, ["throttle", "steer", "resume"], "warn is reversible and shutdown restores the pause");
     const actions = h.engine.events(10).map((e) => e.action);
     assert.ok(!actions.includes("relieved") && !actions.includes("escalated"), "no irreversible rung at warn");
+    assert.equal(h.engine.store.getMeta("throttle-paused"), null, "leader exit restored its wave");
   } finally {
     await cleanup(h.dir);
   }

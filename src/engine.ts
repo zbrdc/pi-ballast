@@ -561,8 +561,8 @@ export class Engine {
         // process still samples and still serves the panel and the tools, it
         // just does not act. It retries each iteration, so the guard survives
         // the session that started it being closed.
+        if (lock !== null && !(await lock.touch())) lock = null;
         if (lock === null) lock = await acquireLock(lockPathFor(this.statePath));
-        else await lock.touch();
 
         // Tier one: totals only. Two short-lived reads, no process table —
         // a few milliseconds. This is all a healthy machine ever pays, and it
@@ -593,12 +593,10 @@ export class Engine {
         }
 
         if (level === "ok") {
-          // Nothing is under pressure, so whatever the throttle rung held goes
-          // back. Only on ok: the old gate was "not ok AND leader", so a
-          // follower under pressure fell into this branch and resumed the
-          // leader's wave a tick after it started, with ten sessions running
-          // that was a matter of seconds.
-          this.resumePaused(pressure, hooks);
+          // Only the leader can have paused anything. A follower sampling an
+          // ok reading must not SIGCONT the leader's wave while its own sample
+          // still says the machine is under pressure.
+          if (lock !== null) this.resumePaused(pressure, hooks);
         } else {
           // BB's order across two different gates: throttle (leader) runs
           // before steer (any session), which runs before relief and
@@ -609,17 +607,19 @@ export class Engine {
           // run at all, not how many times the process table is read: a
           // follower that cannot steer never looks, and the leader reads
           // once however many of its rungs fire.
-          const leads = lock !== null;
+          let leads = lock !== null;
           const steers = this.canSteer(config, level, hooks);
           if (leads || steers) {
             const snap = await this.snapshot(config, 0);
             if (signal.aborted) break;
-            // The plan only matters to the rungs that act on the machine, so
-            // a follower steering alone does not pay for it. A non-null plan
-            // is also the proof this session leads.
-            const plan: Plan | null = leads
-              ? (await this.makePlan(config, snap)).plan
-              : null;
+            // The table walk can take long enough for a stalled lock to be
+            // stolen. Re-validate before acting; a stale leader becomes a
+            // follower in this same iteration instead of double-acting.
+            if (lock !== null && !(await lock.touch())) {
+              lock = null;
+              leads = false;
+            }
+            const plan: Plan | null = leads ? (await this.makePlan(config, snap)).plan : null;
 
             if (plan !== null) this.throttleRung(config, level, plan, pressure, hooks);
             if (steers) this.steerRung(config, level, snap, pressure, hooks, steerState);
@@ -635,6 +635,10 @@ export class Engine {
       await sleep(cadenceMs(config, level), signal);
     }
 
+    // Only the current lock owner resumes what it paused. An outgoing loop
+    // that lost ownership during reload must leave the successor's wave alone.
+    const ownsLock = lock !== null && (await lock.touch());
+    if (ownsLock) this.resumePaused(null, hooks);
     // Hand the machine over. Without this, closing the leader's session left
     // the guard parked until the lock aged out three minutes later, during
     // which no other session could act at all.

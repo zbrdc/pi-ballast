@@ -1,85 +1,65 @@
 # pi-ballast
 
-Memory pressure monitoring and relief for [pi](https://github.com/earendil-works/pi-coding-agent) — a port of [bb-plugin-ballast](https://github.com/braedonsaunders/bb-plugin-ballast), with the web dashboard replaced by a TUI.
+pi-ballast monitors physical memory pressure and process memory use in [pi](https://github.com/earendil-works/pi-coding-agent). It groups processes by tree and project, and can pause or stop a limited set of candidates. This is a pi-only port of [bb-plugin-ballast](https://github.com/braedonsaunders/bb-plugin-ballast); it does not need BB.
 
-## What it does
+## Requirements
 
-Watches physical memory, attributes it to process trees and projects, and when the machine is genuinely struggling, stops the things it can prove nobody is waiting on — orphaned dev servers, leaked headless browsers, dead test runners. Nothing else.
-
-- **Headroom, not "% used"** — free + clean file cache + purgeable, plus paging *rates*. A machine at 90% used with 6 GB of cache is healthy; 400 MB of headroom while paging in is not.
-- **Two-tier guard** — cheap memory samples every cycle, expensive process-table walk only under pressure. A healthy machine is polled 6× less often.
-- **Refuse-by-default relief** — only four kinds are ever killable (headless browsers, dev servers, test runners, build tools), only when orphaned or provably idle, never anything younger than a minute, on a protected port, owned by another user, or part of an agent's own tree. Candidates are re-authorized against the live table at kill time — a recycled PID is refused, not killed.
+- pi
+- macOS or Linux
+- Node.js 22.5 or later (`node:sqlite` is built in)
 
 ## Install
 
-```bash
+```sh
 pi install npm:pi-ballast
 ```
 
 ## Use
 
-| | |
-|---|---|
-| `/ballast` | The dashboard: pressure, top consumers, by project, relief plan, activity trail. `k` stops the selected candidate, `s` cycles auto-relieve. The header shows every rung's configured state. |
-| `ballast_status` | Current pressure level and per-signal detail (agent tool). |
-| `ballast_consumers` | What is holding memory, grouped by tree and by project. |
-| `ballast_plan` | Relief candidates with safe/disruptive risk. Kills nothing. |
-| `ballast_relieve` | Stops candidates by id, with `dryRun` first. |
+Run `/ballast` for the TUI panel. Use the arrow keys to select a candidate, `k` to stop it, `s` to cycle automatic relief, and `q` to close the panel.
 
-A `ballast` skill teaches the agent when to reach for these instead of `top`.
+The agent tools are:
 
-## How the guard acts
+- `ballast_status` — pressure level and the signals behind it.
+- `ballast_consumers` — largest process trees and projects.
+- `ballast_plan` — candidates and their risk. This does not stop anything.
+- `ballast_relieve` — stop candidates by id. Use `dryRun: true` to check first.
 
-A background guard samples memory and grades pressure (`watch` → `warn` → `critical`). When pressure is elevated it climbs a ladder, in order of what an action costs — each rung independently switchable, each with its own cooldown:
+## Guard
 
-1. **Throttle** (`throttle`) — pauses what the relief gate would authorize (`SIGSTOP`), one wave per episode; resumes automatically (`SIGCONT`) when pressure clears or the session exits. Reversible: stopped work loses nothing. Runs at `warn` and above.
-2. **Steer** (`steer`) — sends one message into the session standing in the project that holds ≥256 MB, asking it to close browsers and stop dev servers. Ten-minute cooldown; interactive sessions only. This is the one rung that is **not** leader-only: it acts on a session rather than on the machine, and the session holding the memory is rarely the one that won the election. The ten minutes is claimed in one SQL statement, so two sessions in the same directory can never both speak.
-3. **Relieve** (`autoRelieve`) — stops authorized candidates (`safe`, or `safe` + `disruptive` when `aggressive`) at `critical` (`warn` when `aggressive`). Two-minute cooldown. Re-derives targets from the live process table, so a recycled pid is never killed by a stale plan.
-4. **Escalate** (`escalate`) — spawns a headless `pi -p` with the ballast tools to work the relief plan when the machine is still `critical`. Never fires while a relief wave is landing or when the plan carries nothing actionable. Twenty-minute cooldown.
+One pi process is elected to run the machine-wide actions. Other sessions still sample memory and serve tools and the panel. A session only sends a steer message when its project holds the memory; this works even when that session is not the elected leader. Only the leader resumes its own paused pids on shutdown, so a follower exiting cannot undo another session's throttle.
 
-Underneath the ladder, **context injection** runs continuously: while pressure is elevated, every model request carries a one-line live status (level, headroom, paging rate, sampled-ago) labelled as automatic rather than a user message. The transcript stays clean — pi restores it after each call — but the agent already knows the machine is tight and starts serializing builds on its own. Silent when pressure is `ok` or the reading is stale.
+The guard acts in this order:
 
-Everything destructive stays off by default. Escalation is the rung of record when `autoRelieve` is `off`: nothing dies unattended — something reasons instead.
+1. **Throttle** (`off` by default): pause safe candidates with `SIGSTOP` at `warn` or higher. Resume them with `SIGCONT` when pressure clears or the leader exits.
+2. **Steer** (on by default): at `warn` or higher, ask the matching TUI session to close browsers or dev servers it started. Ten-minute cooldown.
+3. **Relieve** (`autoRelieve: off` by default): at `critical`, stop safe candidates; `aggressive` also permits disruptive candidates and starts at `warn`. Two-minute cooldown.
+4. **Escalate** (`off` by default): at `critical`, start a headless pi to work an actionable plan. It waits for a recent relief wave to finish. Twenty-minute cooldown.
 
-With several pi processes on one machine, exactly one runs the guard's acting rungs. It is chosen by an exclusive lock file (`~/.pi/agent/ballast-guard.lock`) that a session takes on start and releases on exit; a crashed leader's lock is taken over at its next tick, or after three minutes if its pid was recycled. Everyone samples and serves the panel and tools either way — the followers simply do not act. Steer, above, is the deliberate exception.
+A candidate is rechecked against the live process table before a signal is sent. Editors, interactive browsers, agents, pi itself, other users' processes, protected ports, and processes younger than one minute are not stopped.
+
+While pressure is elevated, each model request also receives a short, automatic status note with the latest headroom and paging rate. The note is request-local and does not become part of the conversation history.
 
 ## Configure
 
-`~/.pi/agent/ballast-state.db` holds state (samples, guard events) and config. It is a SQLite database via Node's built-in `node:sqlite` — no npm dependency. Every session, sub-agent and headless child opens the same file, so the store is what makes a fleet of agents safe rather than a source of lost writes:
+State and configuration live in `~/.pi/agent/ballast-state.db`, a SQLite database using Node's built-in `node:sqlite`. The `config` row is JSON. After pi-ballast has created the database, this command enables the safe throttle:
 
-The `config` row holds a JSON string, so it still reads as plain JSON when you edit it (or hand it to `sqlite3`):
-
-```json
-{
-    "thresholds": { "watchPercent": 75, "warnPercent": 85, "criticalPercent": 92, "minHeadroomGb": 3, "swapRateMbPerMin": 200 },
-    "sampleSeconds": 10,
-    "protectedPorts": "3000, 5173",
-    "exemptPatterns": "do-not-touch",
-    "idleMinutes": 30,
-    "autoRelieve": "off",
-    "throttle": "safe",
-    "steer": true,
-    "escalate": false
-}
+```sh
+sqlite3 ~/.pi/agent/ballast-state.db \
+  "INSERT INTO meta(key,value) VALUES('config','{}') ON CONFLICT(key) DO NOTHING;
+   UPDATE meta SET value=json_set(value,'$.throttle','safe') WHERE key='config';"
 ```
 
-`autoRelieve`: `off` (default — you or the agent decide), `safe` (guard stops safe candidates at critical), `aggressive` (adds disruptive candidates).
-`throttle`: `off` (default) or `safe` — pause authorized candidates at `warn` and above, resume on clear.
-`steer`: `true` (default) — message the session holding the memory before anything dies.
-`escalate`: `false` (default) — spawn a headless pi to work the plan when critical persists past relief's cadence.
+Defaults: `autoRelieve: off`, `throttle: off`, `steer: true`, `escalate: false`; watch/warn/critical thresholds are 75/85/92% used, with a 3 GB minimum-headroom threshold.
 
-## Platform support
+## Develop
 
-macOS and Linux (reads `vm_stat`/`sysctl` or `/proc/meminfo`/`/proc/vmstat`).
-
-## Dev
-
-```bash
+```sh
 pnpm install --ignore-workspace
-pnpm test        # 169 tests, node --test over stripped types
-pnpm typecheck   # tsc --noEmit
+pnpm test
+pnpm typecheck
 ```
 
-## License
+## Source and license
 
-MIT, same as the original.
+MIT. See the [BB original](https://github.com/braedonsaunders/bb-plugin-ballast) for the web version.

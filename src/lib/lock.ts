@@ -26,8 +26,8 @@ import { randomUUID } from "node:crypto";
 const STALE_MS = 3 * 60_000;
 
 export interface LockHandle {
-  /** Refresh the heartbeat. Call once per guard iteration. */
-  touch(): Promise<void>;
+  /** Refresh the heartbeat. False means another loop now owns the path. */
+  touch(): Promise<boolean>;
   /** Drop the lock. Safe to call twice. */
   release(): Promise<void>;
 }
@@ -46,7 +46,9 @@ interface LockInfo {
 const readInfo = async (path: string): Promise<LockInfo | null> => {
   try {
     const parsed = JSON.parse(await readFile(path, "utf8")) as Partial<LockInfo>;
-    return typeof parsed.pid === "number" ? { pid: parsed.pid } : null;
+    return typeof parsed.pid === "number"
+      ? { pid: parsed.pid, ...(typeof parsed.token === "string" ? { token: parsed.token } : {}) }
+      : null;
   } catch {
     return null;
   }
@@ -109,22 +111,32 @@ const ageMs = async (path: string, now: number): Promise<number> => {
 
 const makeHandle = (path: string, token: string): LockHandle => {
   let held = true;
+  const stillOwns = async (): Promise<boolean> => {
+    const info = await readInfo(path);
+    return info !== null && info.pid === process.pid && info.token === token;
+  };
   return {
     async touch() {
-      if (!held) return;
+      if (!held || !(await stillOwns())) {
+        held = false;
+        return false;
+      }
       const now = new Date();
-      await utimes(path, now, now).catch(() => {});
+      try {
+        await utimes(path, now, now);
+        return true;
+      } catch {
+        held = false;
+        return false;
+      }
     },
     async release() {
       if (!held) return;
       held = false;
-      // Only drop the lock this exact loop holds. A stolen lock belongs to
-      // someone else, and on a reload the same pid may already be running a
-      // fresh loop whose lock this one must leave alone.
-      const info = await readInfo(path);
-      if (info !== null && (info.pid !== process.pid || (info.token !== undefined && info.token !== token))) {
-        return;
-      }
+      // A same-pid reload has a different token. Only the exact loop that
+      // wrote this file may unlink it; the outgoing loop must not drop the
+      // incoming loop's lock.
+      if (!(await stillOwns())) return;
       await unlink(path).catch(() => {});
     },
   };

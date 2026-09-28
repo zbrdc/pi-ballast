@@ -87,20 +87,17 @@ test("a released lock is available again", async () => {
   });
 });
 
-test("the outgoing loop's release does not drop the incoming loop's lock", async () => {
+test("an outgoing loop cannot touch or release the incoming loop's lock", async () => {
   // A session reload aborts the old loop and starts a new one in the same pid.
-  // Both hold the file at different times; the old one's release must leave
-  // the new one's lock alone, or the machine is left with no guard at all.
+  // The old loop can wake late from a sample or a process-table read. Its
+  // token must keep it from refreshing or unlinking the fresh loop's lock.
   await withTempLock(async (path) => {
     const old = await acquireLock(path);
     const fresh = await acquireLock(path); // reload: same pid, steals back
     assert.ok(fresh, "reload takes the lock back");
-    await old.release(); // the old loop finishing late
-    assert.equal(
-      await acquireLock(lockWithForeignPid(path)),
-      null,
-      "the fresh lock survived the stale release",
-    );
+    assert.equal(await old.touch(), false, "the old heartbeat detects that its token was replaced");
+    await old.release(); // a late finally block from the old loop
+    assert.equal(await fresh.touch(), true, "the new token still owns the lock");
     await fresh.release();
   });
 });

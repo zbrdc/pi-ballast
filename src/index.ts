@@ -67,8 +67,8 @@ export default function ballast(pi: ExtensionAPI) {
     guardAbort?.abort();
     guardAbort = null;
     if (isWorker) return;
-    // Never leave the user's processes stopped behind a session that exited.
-    engine.resumePaused(null);
+    // runGuard releases its lock and resumes its own pause wave after the
+    // abort reaches the loop. A follower must not resume the leader's pids.
     void engine.flush();
   });
 
