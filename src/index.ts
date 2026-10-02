@@ -14,6 +14,7 @@ import { contextBrief, defaultConfig, Engine } from "./engine";
 import { BallastPanel, type PanelAction, type PanelState } from "./panel";
 import { renderConsumers, renderPlan, renderPressure } from "./render";
 import type { AutoRelieve } from "./lib/contract";
+import { parseConfigCommand } from "./lib/config-cmd";
 import { formatBytes } from "./lib/format";
 import { totalsByKind } from "./lib/procs";
 import { kindLabel } from "./lib/ui";
@@ -96,8 +97,14 @@ export default function ballast(pi: ExtensionAPI) {
   /* ---------------- /ballast — the dashboard ---------------- */
 
   pi.registerCommand("ballast", {
-    description: "Memory pressure dashboard",
-    handler: async (_args, ctx) => {
+    description: "Memory pressure dashboard; `config [key value]` and `exempt <pattern>` edit settings",
+    handler: async (args, ctx) => {
+      const command = parseConfigCommand(args ?? "", engine.readConfig(), defaultConfig());
+      if (command.kind !== "none") {
+        if (command.kind === "set") engine.writeConfig(command.config);
+        ctx.ui.notify(command.message, command.kind === "error" ? "error" : "info");
+        return;
+      }
       if (ctx.mode !== "tui") {
         ctx.ui.notify(renderPressure(await engine.readPressure(engine.readConfig())), "info");
         return;

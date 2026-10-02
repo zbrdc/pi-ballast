@@ -83,3 +83,11 @@ construction.
 Do not use `kill`, `pkill` or `killall` to work around that boundary. If you
 need memory from something the gate protects, tell the user what is holding it
 and let them decide.
+
+## Settings
+
+The user edits settings from the `/ballast` command, not the database:
+`/ballast config` prints the effective config, `/ballast config <key> <value>`
+sets one (`thresholds.<key>` for the nested numbers), and
+`/ballast exempt <pattern>` adds a process pattern ballast must never touch.
+Suggest these to the user; do not edit the state database yourself.
