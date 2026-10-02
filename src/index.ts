@@ -44,9 +44,12 @@ export default function ballast(pi: ExtensionAPI) {
       engine.runGuard(signal, silentLog, {
         mode: ctx.mode,
         cwd: ctx.cwd,
-        sendUserMessage: (text) => {
-          void pi.sendUserMessage(text, { deliverAs: "steer" });
+        // An extension message, not sendUserMessage: the latter injects text
+        // the user never typed into the conversation as if they had.
+        sendSteer: (text) => {
+          void pi.sendMessage({ customType: "ballast", content: text, display: true }, { deliverAs: "steer" });
         },
+        setStatus: ctx.hasUI ? (text) => ctx.ui.setStatus("ballast", text) : undefined,
         spawnEscalation: (prompt) => {
           // BALLAST_CHILD tells the child's own extension load that it is a
           // worker, not a session: it registers its tools but starts no guard

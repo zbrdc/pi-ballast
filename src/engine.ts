@@ -140,7 +140,10 @@ export function contextBrief(
 export interface GuardHooks {
   stop?: (pid: number) => void;
   cont?: (pid: number) => void;
-  sendUserMessage?: (text: string) => void;
+  /** Delivers a steer to the session as an extension message, not as user input. */
+  sendSteer?: (text: string) => void;
+  /** Status-line text while pressure is above ok; undefined clears it. */
+  setStatus?: (text: string | undefined) => void;
   spawnEscalation?: (prompt: string) => void;
   /** Session context for the steer rung. */
   cwd?: string;
@@ -449,6 +452,30 @@ export class Engine {
     return top;
   }
 
+  /** Compact status-line text, or undefined when the machine is fine. */
+  private statusText(pressure: Pressure): string | undefined {
+    if (pressure.level === "ok") return undefined;
+    const free = formatBytes(pressure.sample.headroomBytes);
+    const top = this.topConsumer();
+    const named = top ? ` · ${top.label} ${formatBytes(top.bytes)}` : "";
+    return `ballast: ${pressure.level.toUpperCase()} ${free} free${named}`;
+  }
+
+  /**
+   * Pushes the status only when its text changed: the guard samples every few
+   * seconds and a repaint of the footer per sample is churn. Returns the text
+   * to remember as "last pushed".
+   */
+  private publishStatus(
+    pressure: Pressure,
+    hooks: GuardHooks,
+    last: string | undefined,
+  ): string | undefined {
+    const text = this.statusText(pressure);
+    if (text !== last) hooks.setStatus?.(text);
+    return text;
+  }
+
   private recordTopConsumer(consumers: Consumer[], totalBytes: number): void {
     let top: Consumer | null = null;
     for (const c of consumers) {
@@ -506,7 +533,7 @@ export class Engine {
     state: { steered: boolean },
   ): void {
     if (!config.steer || level === "watch") return;
-    if (!hooks.sendUserMessage || hooks.mode !== "tui" || !hooks.cwd) return;
+    if (!hooks.sendSteer || hooks.mode !== "tui" || !hooks.cwd) return;
     if (state.steered) return;
     const items = steerCandidates(snap, hooks.cwd);
     const bytes = items.reduce((sum, c) => sum + c.bytes, 0);
@@ -517,7 +544,7 @@ export class Engine {
     if (!this.store.claimCooldown("last-steer", Date.now(), STEER_COOLDOWN_MS)) return;
     state.steered = true;
     const named = items.slice(0, STEER_MAX_ITEMS).map(describeSteerItem).join("; ");
-    hooks.sendUserMessage(
+    hooks.sendSteer(
       `Memory pressure is ${level} (${pressure.reason}). ` +
         `This session started ${named}. ` +
         "Stop the ones you no longer need, or run /ballast.",
@@ -581,7 +608,7 @@ export class Engine {
    */
   private canSteer(config: Config, level: PressureLevel, hooks: GuardHooks): boolean {
     if (!config.steer || level === "watch") return false;
-    return hooks.sendUserMessage !== undefined && hooks.mode === "tui" && Boolean(hooks.cwd);
+    return hooks.sendSteer !== undefined && hooks.mode === "tui" && Boolean(hooks.cwd);
   }
 
   /**
@@ -654,6 +681,7 @@ export class Engine {
     const steerState = { steered: false };
     let lastLevel = this.store.getMeta<PressureLevel>("last-level");
     let pendingLevel: PressureLevel | null = null;
+    let lastStatus: string | undefined;
     let lock: LockHandle | null = null;
 
     while (!signal.aborted) {
@@ -676,6 +704,7 @@ export class Engine {
         if (signal.aborted) break;
         level = pressure.level;
         this.store.recordSample(pressure.sample);
+        lastStatus = this.publishStatus(pressure, hooks, lastStatus);
 
         // A level change has to survive one more sample before it counts.
         // Without this, a single burst of paging writes a critical/warn pair

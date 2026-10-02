@@ -68,7 +68,7 @@ const harness = async (over = {}) => {
   const hooks = {
     mode: "tui",
     cwd: PROJECT,
-    sendUserMessage: (text) => sent.push(text),
+    sendSteer: (text) => sent.push(text),
     ...over.hooks,
   };
   return {
@@ -235,7 +235,7 @@ test("steer: false is configured out entirely", async () => {
 });
 
 test("no messaging hook, no crash", async () => {
-  const h = await harness({ hooks: { sendUserMessage: undefined } });
+  const h = await harness({ hooks: { sendSteer: undefined } });
   try {
     h.engine.steerRung(h.config, "warn", snapOf([threadConsumer()]), pressure, h.hooks, { steered: false });
     assert.equal(h.sent.length, 0);

@@ -41,7 +41,7 @@ const makePi = () => {
     registerTool: (definition) => tools.set(definition.name, definition),
     getAllTools: () => [],
     registerCommand: () => {},
-    sendUserMessage: () => {},
+    sendMessage: () => {},
     on: (event, handler) => handlers.set(event, handler),
   };
 };

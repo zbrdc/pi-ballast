@@ -99,7 +99,7 @@ const harness = async (over = {}) => {
     cwd: PROJECT,
     stop: (pid) => order.push(["throttle", pid]),
     cont: (pid) => order.push(["resume", pid]),
-    sendUserMessage: (text) => order.push(["steer", text]),
+    sendSteer: (text) => order.push(["steer", text]),
     spawnEscalation: (prompt) => order.push(["escalate", prompt]),
     ...over.hooks,
   };
@@ -341,6 +341,43 @@ test("a follower never writes the top consumer", async () => {
   try {
     await drive(h.engine, ["critical", "critical"], h.hooks);
     assert.equal(h.engine.store.getMeta("top-consumer"), null);
+  } finally {
+    await cleanup(h.dir);
+  }
+});
+
+test("status hook: text while pressured, once per change, cleared on return to ok", async () => {
+  const calls = [];
+  const h = await harness({ hooks: { setStatus: (text) => calls.push(text) } });
+  try {
+    const big = { ...threadConsumer, id: "pid:7", label: "strata", kind: "other", bytes: 8 * 1024 ** 3, threadId: null };
+    // Seed what the leader will record itself so the text is stable across ticks.
+    h.engine.store.setMeta("top-consumer", {
+      label: "strata", kind: "other", bytes: big.bytes, threadId: null, fraction: 0.5, atMs: Date.now(),
+    });
+    await drive(h.engine, ["warn", "warn", "warn", "ok", "ok"], h.hooks, [big]);
+    assert.deepEqual(calls, ["ballast: WARN 1.00 GB free · strata 8.00 GB", undefined]);
+  } finally {
+    await cleanup(h.dir);
+  }
+});
+
+test("status hook stays silent while the machine is ok", async () => {
+  const calls = [];
+  const h = await harness({ hooks: { setStatus: (text) => calls.push(text) } });
+  try {
+    await drive(h.engine, ["ok", "ok", "ok"], h.hooks);
+    assert.deepEqual(calls, []);
+  } finally {
+    await cleanup(h.dir);
+  }
+});
+
+test("steer is delivered through sendSteer", async () => {
+  const h = await harness();
+  try {
+    await drive(h.engine, ["critical", "critical"], h.hooks);
+    assert.ok(h.order.some(([k]) => k === "steer"), "sendSteer received the message");
   } finally {
     await cleanup(h.dir);
   }
