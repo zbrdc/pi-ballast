@@ -227,7 +227,8 @@ export interface GuardEvent {
     | "throttled"
     | "restored"
     | "escalated"
-    | "suppressed";
+    | "suppressed"
+    | "oom-killed";
   detail: string;
   bytesFreed: number;
   threadId: string | null;

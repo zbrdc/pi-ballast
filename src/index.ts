@@ -84,7 +84,9 @@ export default function ballast(pi: ExtensionAPI) {
   pi.on("context", (event) => {
     const pressure = engine.lastReading();
     if (!pressure) return;
-    const brief = contextBrief(pressure, Date.now(), engine.topConsumer());
+    const brief = contextBrief(pressure, Date.now(), engine.topConsumer(), {
+      kills: engine.recentOomKills(),
+    });
     if (!brief) return;
     return {
       messages: [...event.messages, { role: "user", content: brief, timestamp: Date.now() }],

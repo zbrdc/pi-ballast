@@ -6,7 +6,7 @@
  * authorized candidates, steer = a message into the session whose project is
  * holding the memory, escalate = a headless pi working the relief plan.
  */
-import { availableParallelism } from "node:os";
+import { availableParallelism, platform } from "node:os";
 import type {
   Candidate,
   Config,
@@ -24,6 +24,7 @@ import { cadenceMs, parseLines, parsePorts } from "./lib/policy";
 import { evaluatePressure } from "./lib/pressure";
 import { applyRelief, buildPlan } from "./lib/relieve";
 import { acquireLock, lockPathFor, type LockHandle } from "./lib/lock";
+import { oomDetail, parseOomDetail, readOomKills, type OomKill } from "./lib/oom";
 import { Store } from "./lib/store";
 import { formatBytes, formatRate } from "./lib/format";
 
@@ -109,31 +110,73 @@ function budgetLines(headroomBytes: number, cpus: number | undefined): string[] 
   ];
 }
 
+/** A kill older than this is no longer a plausible cause of a failing command. */
+const OOM_WINDOW_MS = 15 * 60_000;
+/** The journal is a subprocess; the leader asks at most this often. */
+const OOM_POLL_MS = 60_000;
+const OOM_CURSOR_KEY = "oom-cursor";
+/** More than this many kills in the brief is noise; the newest are enough. */
+const BRIEF_MAX_KILLS = 3;
+
+/** Optional brief inputs; a bare number is the CPU count (the original 4th parameter). */
+export interface BriefOptions {
+  cpus?: number;
+  kills?: OomKill[];
+}
+
+function killLine(kill: OomKill, now: number): string {
+  const minutes = Math.max(0, Math.round((now - kill.atMs) / 60_000));
+  return `Kernel OOM-killed ${kill.name} (pid ${kill.pid}) ${minutes}m ago — a command exiting 137/SIGKILL was likely this.`;
+}
+
+function killLines(kills: OomKill[], now: number): string[] {
+  return kills
+    .filter((kill) => now - kill.atMs <= OOM_WINDOW_MS)
+    .sort((a, b) => b.atMs - a.atMs)
+    .slice(0, BRIEF_MAX_KILLS)
+    .map((kill) => killLine(kill, now));
+}
+
 /**
  * The brief injected into the model's context on every request while
  * pressure is elevated — the pi equivalent of BB's contributeInstructions.
- * Returns null when there is nothing worth saying: level ok, or a reading
- * too stale to trust. Watch carries the numbers only; advice starts at warn
- * so a merely busy machine is not nagged on every request.
+ * Returns null when there is nothing worth saying: level ok with no recent
+ * kernel kill, or a reading too stale to trust. Watch carries the numbers
+ * only; advice starts at warn so a merely busy machine is not nagged on every
+ * request. A recent OOM kill is reported even at ok: the machine has
+ * recovered, but the agent's failed command still needs explaining.
  */
 export function contextBrief(
   pressure: Pressure,
   now = Date.now(),
   top?: TopConsumer | null,
-  cpus?: number,
+  options?: BriefOptions | number,
 ): string | null {
-  if (pressure.level === "ok") return null;
-  if (now - pressure.sample.atMs > CONTEXT_STALE_MS) return null;
+  const { cpus, kills = [] } = typeof options === "number" ? { cpus: options } : (options ?? {});
+  const killNotes = killLines(kills, now);
+  const header = "Note from ballast, the memory monitor (automatic status, not a user message):";
+  const reading = pressureLines(pressure, now, top, cpus);
+  if (reading.length === 0 && killNotes.length === 0) return null;
+  return [header, ...reading, ...killNotes].join("\n");
+}
+
+function pressureLines(
+  pressure: Pressure,
+  now: number,
+  top: TopConsumer | null | undefined,
+  cpus: number | undefined,
+): string[] {
+  if (pressure.level === "ok") return [];
+  if (now - pressure.sample.atMs > CONTEXT_STALE_MS) return [];
   const { sample } = pressure;
   const parts = [`${pressure.level.toUpperCase()} — headroom ${formatBytes(sample.headroomBytes)}`];
   if (sample.swapInRate > 0) parts.push(`paging in ${formatRate(sample.swapInRate)}`);
   parts.push(`sampled ${Math.max(0, Math.round((now - sample.atMs) / 1000))}s ago`);
   return [
-    "Note from ballast, the memory monitor (automatic status, not a user message):",
     `Memory pressure ${parts.join(", ")}.`,
     ...(top ? [topConsumerLine(top)] : []),
     ...(pressure.level === "watch" ? [] : budgetLines(sample.headroomBytes, cpus)),
-  ].join("\n");
+  ];
 }
 
 /** Rung side effects, injectable so tests never touch real processes. */
@@ -145,6 +188,8 @@ export interface GuardHooks {
   /** Status-line text while pressure is above ok; undefined clears it. */
   setStatus?: (text: string | undefined) => void;
   spawnEscalation?: (prompt: string) => void;
+  /** Kernel OOM kills since a timestamp; defaults to the journal reader. */
+  readOomKills?: (sinceMs: number) => Promise<OomKill[]>;
   /** Session context for the steer rung. */
   cwd?: string;
   mode?: string;
@@ -205,6 +250,7 @@ export class Engine {
   private readonly statePath: string;
   private cursor: RateCursor | null = null;
   private lastPressure: Pressure | null = null;
+  private lastOomPollMs = 0;
   private recentSwapIn: number[] = [];
   private recentSwapOut: number[] = [];
   private snapshotCache: { at: number; value: Snapshot } | null = null;
@@ -450,6 +496,49 @@ export class Engine {
     const top = this.store.getMeta<TopConsumer>(TOP_CONSUMER_KEY);
     if (top === null || now - top.atMs > CONTEXT_STALE_MS) return null;
     return top;
+  }
+
+  /**
+   * Kernel OOM kills the leader recorded inside the window, newest first.
+   * Read from the event log so followers see them without touching the journal.
+   */
+  recentOomKills(windowMs = OOM_WINDOW_MS, now = Date.now()): OomKill[] {
+    const kills: OomKill[] = [];
+    for (const event of this.store.events(200)) {
+      if (event.action !== "oom-killed" || now - event.atMs > windowMs) continue;
+      const who = parseOomDetail(event.detail);
+      if (who === null) continue;
+      kills.push({ atMs: event.atMs, ...who, ...(event.bytesFreed > 0 && { rssBytes: event.bytesFreed }) });
+    }
+    return kills;
+  }
+
+  /**
+   * Leader-only. The cursor lives in meta so a restart does not re-report
+   * kills, and a first run looks back only one window rather than flooding the
+   * log with a month of history.
+   */
+  private async pollOomKills(pressure: Pressure, hooks: GuardHooks, now: number): Promise<void> {
+    if (platform() !== "linux" || now - this.lastOomPollMs < OOM_POLL_MS) return;
+    this.lastOomPollMs = now;
+    const cursor = this.store.getMeta<number>(OOM_CURSOR_KEY) ?? now - OOM_WINDOW_MS;
+    const kills = await (hooks.readOomKills ?? readOomKills)(cursor + 1);
+    let newest = cursor;
+    for (const kill of kills) {
+      if (kill.atMs <= cursor) continue;
+      this.store.recordGuardEvent({
+        atMs: kill.atMs,
+        level: pressure.level,
+        headroomBytes: pressure.sample.headroomBytes,
+        usedFraction: usedFractionOf(pressure),
+        action: "oom-killed",
+        detail: oomDetail(kill),
+        bytesFreed: kill.rssBytes ?? 0,
+        threadId: null,
+      });
+      newest = Math.max(newest, kill.atMs);
+    }
+    this.store.setMeta(OOM_CURSOR_KEY, newest);
   }
 
   /** Compact status-line text, or undefined when the machine is fine. */
@@ -704,6 +793,7 @@ export class Engine {
         if (signal.aborted) break;
         level = pressure.level;
         this.store.recordSample(pressure.sample);
+        if (lock !== null) await this.pollOomKills(pressure, hooks, Date.now());
         lastStatus = this.publishStatus(pressure, hooks, lastStatus);
 
         // A level change has to survive one more sample before it counts.
