@@ -322,13 +322,14 @@ test("warn engages throttle and steer but never relief or escalation", async () 
 test("leader records the largest non-system consumer after its snapshot", async () => {
   const h = await harness();
   try {
-    const big = { ...threadConsumer, id: "pid:7", label: "strata", kind: "other", bytes: 8 * 1024 ** 3, threadId: null };
+    const big = { ...threadConsumer, id: "pid:7", label: "strata", kind: "other", bytes: 8 * 1024 ** 3, threadId: null, threadTitle: null };
     const sys = { ...threadConsumer, id: "pid:1", label: "kernel", kind: "system", bytes: 12 * 1024 ** 3, threadId: null };
     await drive(h.engine, ["critical", "critical"], h.hooks, [threadConsumer, big, sys]);
     const top = h.engine.store.getMeta("top-consumer");
     assert.equal(top.label, "strata");
     assert.equal(top.bytes, 8 * 1024 ** 3);
     assert.equal(top.threadId, null);
+    assert.equal(top.threadTitle, null);
     assert.equal(top.fraction, 0.5);
     assert.equal(typeof top.atMs, "number");
   } finally {

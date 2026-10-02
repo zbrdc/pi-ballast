@@ -78,10 +78,19 @@ test("watch counts as elevated but carries no advice", () => {
 test("warn and critical carry the budget and the plan pointer", () => {
   for (const level of ["warn", "critical"]) {
     const brief = contextBrief(pressureOf({ level }), Date.now(), null, 8);
-    assert.ok(brief.includes("Budget for new work: ~1 parallel jobs (e.g. make -j1"));
+    assert.ok(brief.includes("Budget for new work: one job at a time — run builds and tests serially (make -j1"));
+    assert.ok(!brief.includes("~1 parallel jobs"));
+    assert.ok(!brief.includes("if they launch browsers"));
     assert.ok(brief.includes("Use ballast_plan before stopping anything you did not start."));
     assert.ok(!brief.includes("Close browsers"));
   }
+});
+
+test("budget with room for several jobs keeps the parallel wording", () => {
+  const roomy = sampleOver(pressureOf({ level: "warn" }), { headroomBytes: 7 * GB });
+  const brief = contextBrief(roomy, Date.now(), null, 16);
+  assert.ok(brief.includes("Budget for new work: ~3 parallel jobs (e.g. make -j3, cargo build -j3, --test-threads=3)."));
+  assert.ok(brief.includes("Run test suites serially if they launch browsers."));
 });
 
 test("paging rate is per minute from a per-second sample", () => {
@@ -141,6 +150,17 @@ test("brief names the top consumer outside any project", () => {
 test("brief names the project when the top consumer has a thread", () => {
   const brief = contextBrief(pressureOf(), Date.now(), topOf({ threadId: "/home/dev/hold" }));
   assert.ok(brief.includes("in project /home/dev/hold."));
+});
+
+test("brief prefers the project title over the full path", () => {
+  const top = topOf({ threadId: "/home/dev/hold", threadTitle: "hold" });
+  assert.ok(contextBrief(pressureOf(), Date.now(), top).includes("in project hold."));
+});
+
+test("a stored record without threadTitle falls back to the thread id", () => {
+  const legacy = topOf({ threadId: "/home/dev/hold" });
+  delete legacy.threadTitle;
+  assert.ok(contextBrief(pressureOf(), Date.now(), legacy).includes("in project /home/dev/hold."));
 });
 
 test("absent top consumer omits the line", () => {

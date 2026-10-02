@@ -77,6 +77,8 @@ export interface TopConsumer {
   kind: string;
   bytes: number;
   threadId: string | null;
+  /** Project name for display; absent in records stored before it was added. */
+  threadTitle?: string | null;
   atMs: number;
   /** bytes / total RAM, 0..1. */
   fraction: number;
@@ -85,7 +87,8 @@ export interface TopConsumer {
 const TOP_CONSUMER_KEY = "top-consumer";
 
 function topConsumerLine(top: TopConsumer): string {
-  const where = top.threadId === null ? "outside any project" : `in project ${top.threadId}`;
+  const where =
+    top.threadId === null ? "outside any project" : `in project ${top.threadTitle ?? top.threadId}`;
   const share = Math.round(top.fraction * 100);
   return `Largest consumer: ${top.label} (${formatBytes(top.bytes)}, ${share}% of RAM), ${where}.`;
 }
@@ -104,10 +107,12 @@ export function parallelBudget(headroomBytes: number, cpus = availableParallelis
 
 function budgetLines(headroomBytes: number, cpus: number | undefined): string[] {
   const jobs = parallelBudget(headroomBytes, cpus);
-  return [
-    `Budget for new work: ~${jobs} parallel jobs (e.g. make -j${jobs}, cargo build -j${jobs}, --test-threads=${jobs}). Run test suites serially if they launch browsers.`,
-    "Use ballast_plan before stopping anything you did not start.",
-  ];
+  // One job already means serial tests, so the browser caveat would repeat it.
+  const budget =
+    jobs === 1
+      ? "Budget for new work: one job at a time — run builds and tests serially (make -j1, cargo build -j1, --test-threads=1)."
+      : `Budget for new work: ~${jobs} parallel jobs (e.g. make -j${jobs}, cargo build -j${jobs}, --test-threads=${jobs}). Run test suites serially if they launch browsers.`;
+  return [budget, "Use ballast_plan before stopping anything you did not start."];
 }
 
 /** A kill older than this is no longer a plausible cause of a failing command. */
@@ -578,6 +583,7 @@ export class Engine {
       kind: top.kind,
       bytes: top.bytes,
       threadId: top.threadId,
+      threadTitle: top.threadTitle,
       atMs: Date.now(),
       fraction: totalBytes > 0 ? top.bytes / totalBytes : 0,
     };
