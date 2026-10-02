@@ -578,12 +578,18 @@ export class Engine {
         // into the log every couple of minutes.
         if (level !== lastLevel) {
           if (level === pendingLevel) {
-            if (lastLevel !== null || level !== "ok") {
-              this.record(pressure, "observed", pressure.reason);
+            // The event log and "last-level" are machine-shared, so only the
+            // leader writes them. Every session observes the same transition;
+            // letting each record it put duplicate rows at the same millisecond.
+            // Followers still track the level locally and still log.
+            if (lock !== null) {
+              if (lastLevel !== null || level !== "ok") {
+                this.record(pressure, "observed", pressure.reason);
+              }
+              this.store.setMeta("last-level", level);
             }
             log(`pressure ${lastLevel ?? "unknown"} → ${level}: ${pressure.reason}`);
             lastLevel = level;
-            this.store.setMeta("last-level", level);
             pendingLevel = null;
           } else {
             pendingLevel = level;

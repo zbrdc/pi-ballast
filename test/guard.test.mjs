@@ -227,6 +227,23 @@ test("a follower holds no machine rungs at all", async () => {
   }
 });
 
+test("only the leader records the observed transition", async () => {
+  const leader = await harness();
+  const follower = await harness({ follower: true });
+  try {
+    await drive(leader.engine, ["critical", "critical"], leader.hooks);
+    await drive(follower.engine, ["critical", "critical"], follower.hooks);
+    const observed = (h) => h.engine.events(10).filter((e) => e.action === "observed").length;
+    assert.equal(observed(leader), 1, "the leader records the level change once");
+    assert.equal(observed(follower), 0, "a follower leaves the shared log alone");
+    assert.equal(leader.engine.store.getMeta("last-level"), "critical");
+    assert.equal(follower.engine.store.getMeta("last-level"), null, "and the shared meta");
+  } finally {
+    await cleanup(leader.dir);
+    await cleanup(follower.dir);
+  }
+});
+
 /**
  * The resume bug this gate split exposed.
  *
