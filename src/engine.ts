@@ -33,7 +33,34 @@ const SNAPSHOT_TTL_MS = 4000;
 /** Cooldown after an auto-relieve before another is attempted. */
 export const RELIEF_COOLDOWN_MS = 2 * 60_000;
 export const STEER_COOLDOWN_MS = 10 * 60_000;
+/**
+ * A steer interrupts the agent, so it must be worth the interruption: the
+ * stoppable processes the session owns have to add up to at least this much.
+ * Below it, stopping them would not move the machine and the message is noise.
+ */
+export const STEER_MIN_BYTES = 1024 ** 3;
+/** Most items a steer message names; the rest are summed into the byte total only. */
+const STEER_MAX_ITEMS = 5;
+/** Kinds a session started and can stop. Never its own pi, agents, editors or the system. */
+const STEERABLE_KINDS: ReadonlySet<string> = new Set(["browser-automation", "dev-server", "test-runner"]);
 export const ESCALATION_COOLDOWN_MS = 20 * 60_000;
+
+/** Stoppable consumers in the session's project, largest first, never the guard's own tree. */
+function steerCandidates(snap: Snapshot, cwd: string): Consumer[] {
+  return snap.consumers
+    .filter(
+      (c) =>
+        c.threadId === cwd &&
+        STEERABLE_KINDS.has(c.kind) &&
+        !c.pids.some((pid) => snap.selfPids.has(pid)),
+    )
+    .sort((a, b) => b.bytes - a.bytes);
+}
+
+function describeSteerItem(c: Consumer): string {
+  const port = c.port === null ? "" : ` on :${c.port}`;
+  return `${c.label}${port} (pid ${c.rootPid}) ${formatBytes(c.bytes)}`;
+}
 
 /**
  * How stale a cached reading may be before the context injection stays
@@ -405,23 +432,24 @@ export class Engine {
     if (!config.steer || level === "watch") return;
     if (!hooks.sendUserMessage || hooks.mode !== "tui" || !hooks.cwd) return;
     if (state.steered) return;
-    const holding = snap.threads.find((row) => row.threadId === hooks.cwd);
-    if (!holding || holding.bytes < 256 * 1024 ** 2) return;
+    const items = steerCandidates(snap, hooks.cwd);
+    const bytes = items.reduce((sum, c) => sum + c.bytes, 0);
+    if (bytes < STEER_MIN_BYTES) return;
     // Claim the cooldown before speaking, not after: sessions are no longer
     // serialised by the leader lock, so two of them standing in the same
     // project reach this line together. The store decides, in one statement.
     if (!this.store.claimCooldown("last-steer", Date.now(), STEER_COOLDOWN_MS)) return;
     state.steered = true;
+    const named = items.slice(0, STEER_MAX_ITEMS).map(describeSteerItem).join("; ");
     hooks.sendUserMessage(
       `Memory pressure is ${level} (${pressure.reason}). ` +
-        `This session's project (${holding.label}) is holding ${formatBytes(holding.bytes)}. ` +
-        "Close Playwright browsers and stop dev servers you started when they are " +
-        "no longer needed, or run /ballast.",
+        `This session started ${named}. ` +
+        "Stop the ones you no longer need, or run /ballast.",
     );
     this.record(
       pressure,
       "steered",
-      `asked ${holding.label} (${formatBytes(holding.bytes)}) to release`,
+      `asked about ${items.length} process${items.length === 1 ? "" : "es"} (${formatBytes(bytes)}) to release`,
       0,
     );
   }

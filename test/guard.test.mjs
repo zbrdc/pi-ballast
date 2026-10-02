@@ -56,7 +56,7 @@ const threadConsumer = {
   label: "hold",
   detail: "npm run dev",
   kind: "dev-server",
-  bytes: 512 * 1024 ** 2,
+  bytes: 2 * 1024 ** 3,
   processCount: 1,
   rootPid: 100,
   parentPid: 1,

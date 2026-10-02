@@ -38,7 +38,7 @@ const threadConsumer = (over = {}) => ({
   label: "hold",
   detail: "npm run dev",
   kind: "dev-server",
-  bytes: 512 * 1024 ** 2,
+  bytes: 2 * 1024 ** 3,
   processCount: 1,
   rootPid: 100,
   parentPid: 1,
@@ -89,8 +89,12 @@ test("warn level, holding project, expired cooldown: the message goes", async ()
   try {
     h.engine.steerRung(h.config, "warn", snapOf([threadConsumer()]), pressure, h.hooks, { steered: false });
     assert.equal(h.sent.length, 1, "one message");
-    assert.match(h.sent[0], /hold/, "names the project");
-    assert.match(h.sent[0], /512\.0 MB|512 MB/, "states what it holds");
+    assert.match(h.sent[0], /Memory pressure is warn \(headroom/, "keeps the lead sentence");
+    assert.match(h.sent[0], /npm run dev|hold/, "names the item");
+    assert.match(h.sent[0], /pid 100/, "names the root pid");
+    assert.match(h.sent[0], /2\.00 GB|2 GB/, "states its size");
+    assert.doesNotMatch(h.sent[0], /Playwright/, "no generic advice");
+    assert.match(h.engine.events(1)[0].detail, /1 process .*to release/, "record names count and bytes");
     assert.notEqual(h.engine.store.getMeta("last-steer"), null, "cooldown starts");
     assert.equal(h.engine.events(1)[0].action, "steered", "on the record");
   } finally {
@@ -157,11 +161,64 @@ test("headless sessions cannot steer", async () => {
   }
 });
 
-test("a small holder is not worth a message", async () => {
+test("below the byte floor is not worth a message", async () => {
   const h = await harness();
   try {
-    h.engine.steerRung(h.config, "warn", snapOf([threadConsumer({ bytes: 100 * 1024 ** 2 })]), pressure, h.hooks, { steered: false });
+    const snap = snapOf([threadConsumer({ bytes: 600 * 1024 ** 2 }), threadConsumer({ id: "pid:101", rootPid: 101, pids: [101], bytes: 300 * 1024 ** 2 })]);
+    h.engine.steerRung(h.config, "warn", snap, pressure, h.hooks, { steered: false });
     assert.equal(h.sent.length, 0);
+    assert.equal(h.engine.store.getMeta("last-steer"), null, "no cooldown claimed for silence");
+  } finally {
+    await cleanup(h.dir);
+  }
+});
+
+test("a thread holding only pi itself is never messaged", async () => {
+  const h = await harness();
+  try {
+    const pi = threadConsumer({ id: "pid:50", kind: "pi", label: "pi", rootPid: 50, pids: [50], bytes: 5 * 1024 ** 3 });
+    h.engine.steerRung(h.config, "warn", snapOf([pi]), pressure, h.hooks, { steered: false });
+    assert.equal(h.sent.length, 0, "agents, editors and browsers are not the session's to stop");
+  } finally {
+    await cleanup(h.dir);
+  }
+});
+
+test("dev server and headless browser add up and are named, largest first", async () => {
+  const h = await harness();
+  try {
+    const server = threadConsumer({ id: "pid:99", label: "vite", rootPid: 99, pids: [99], port: 5173, bytes: 600 * 1024 ** 2 });
+    const browser = threadConsumer({ id: "pid:1234", label: "Headless browser", kind: "browser-automation", rootPid: 1234, pids: [1234], bytes: 1.2 * 1024 ** 3 });
+    h.engine.steerRung(h.config, "warn", snapOf([server, browser]), pressure, h.hooks, { steered: false });
+    assert.equal(h.sent.length, 1);
+    assert.match(h.sent[0], /Headless browser \(pid 1234\) 1\.20 GB; vite on :5173 \(pid 99\) 600 MB/);
+    assert.match(h.sent[0], /Stop the ones you no longer need, or run \/ballast\./);
+    assert.match(h.engine.events(1)[0].detail, /2 processes/);
+  } finally {
+    await cleanup(h.dir);
+  }
+});
+
+test("the guard's own process tree is excluded", async () => {
+  const h = await harness();
+  try {
+    const own = threadConsumer({ id: "pid:7", rootPid: 7, pids: [7, 8], bytes: 3 * 1024 ** 3 });
+    const snap = { ...snapOf([own]), selfPids: new Set([8]) };
+    h.engine.steerRung(h.config, "warn", snap, pressure, h.hooks, { steered: false });
+    assert.equal(h.sent.length, 0);
+  } finally {
+    await cleanup(h.dir);
+  }
+});
+
+test("only five items are named", async () => {
+  const h = await harness();
+  try {
+    const many = Array.from({ length: 7 }, (_, i) =>
+      threadConsumer({ id: `pid:${200 + i}`, label: `srv${i}`, rootPid: 200 + i, pids: [200 + i], bytes: (300 + i) * 1024 ** 2 }));
+    h.engine.steerRung(h.config, "warn", snapOf(many), pressure, h.hooks, { steered: false });
+    assert.equal((h.sent[0].match(/pid /g) ?? []).length, 5);
+    assert.match(h.engine.events(1)[0].detail, /7 processes/);
   } finally {
     await cleanup(h.dir);
   }
