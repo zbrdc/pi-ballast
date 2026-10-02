@@ -2,15 +2,20 @@
  * Grading a reading into a level.
  *
  * Four independent signals, each graded on its own, and the worst one wins.
- * A single percentage cannot express this: 90% used with 4 GB of clean file
- * cache behind it is fine, and 70% used while paging in 300 MB a minute is
- * not. The reason string always names the signal that decided, because a
- * banner that says "memory is critical" without saying which number moved is
- * an alarm you learn to ignore.
+ * Percent used is capped at "watch": it measures risk, not harm, and a box
+ * holding one large intentional process sits above 90% forever with plenty of
+ * headroom and no stalls. Warn and critical come only from headroom, paging
+ * rate, or the kernel's own verdict. A single percentage cannot express this:
+ * 90% used with 4 GB of clean file cache behind it is fine, and 70% used while
+ * paging in 300 MB a minute is not. The reason string always names the signal
+ * that decided, because a banner that says "memory is critical" without saying
+ * which number moved is an alarm you learn to ignore.
  */
 import type { MemorySample, Pressure, PressureLevel, Thresholds } from "./contract";
 import { formatBytes, formatPercent, formatRate } from "./format";
 
+// warnPercent and criticalPercent no longer escalate (percent is capped at
+// "watch"); they stay so configs stored by earlier versions still parse.
 export const DEFAULT_THRESHOLDS: Thresholds = {
   watchPercent: 75,
   warnPercent: 85,
@@ -45,8 +50,6 @@ function gradePercent(sample: MemorySample, thresholds: Thresholds): Signal | nu
   const fraction = usedFraction(sample);
   const percent = fraction * 100;
   const detail = `${formatPercent(fraction, 1)} of ${formatBytes(sample.totalBytes)} in use`;
-  if (percent >= thresholds.criticalPercent) return { level: "critical", detail };
-  if (percent >= thresholds.warnPercent) return { level: "warn", detail };
   if (percent >= thresholds.watchPercent) return { level: "watch", detail };
   return null;
 }

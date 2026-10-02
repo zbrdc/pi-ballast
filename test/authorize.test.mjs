@@ -152,6 +152,17 @@ test("a machine with plenty of headroom grades ok, however full it looks", () =>
   assert.equal(pressure.level, "ok");
 });
 
+test("percent used alone never grades above watch", () => {
+  // 95% used, but 10 GB is still available and nothing is paging: one large
+  // intentional process, not a machine in trouble.
+  const pressure = evaluatePressure(
+    sample({ usedBytes: 22.8 * 1024 ** 3, headroomBytes: 10 * 1024 ** 3 }),
+    DEFAULT_THRESHOLDS,
+  );
+  assert.equal(pressure.level, "watch");
+  assert.match(pressure.reason, /in use/);
+});
+
 test("headroom is graded in absolute terms, not as a percentage", () => {
   // 62% used — a percentage-only rule would call this healthy — but only
   // 700 MB of headroom left.
