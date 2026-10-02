@@ -78,6 +78,32 @@ export function parseKernelPressure(text: string): MemorySample["kernelPressure"
   return null;
 }
 
+// avg10 is the most responsive PSI window. "some" is time at least one task
+// stalled on memory; "full" is time all non-idle tasks stalled at once, so a
+// much lower full figure already means the machine is thrashing.
+const PSI_SOME_WARN = 10;
+const PSI_SOME_CRITICAL = 40;
+const PSI_FULL_WARN = 2.5;
+const PSI_FULL_CRITICAL = 10;
+
+/**
+ * Linux's own verdict on memory stalls, from /proc/pressure/memory. Unlike
+ * "% used" it ignores a big process that is resident but not contended, which
+ * is exactly the case where nothing is actually wrong. Anything unparseable
+ * (kernel without PSI, empty text) is null rather than a guess.
+ */
+export function parsePsiPressure(text: string): MemorySample["kernelPressure"] {
+  const avg10 = (kind: string): number => {
+    const match = new RegExp(`^${kind}\\s.*\\bavg10=([\\d.]+)`, "m").exec(text);
+    return match === null ? 0 : Number(match[1]);
+  };
+  const some = avg10("some");
+  const full = avg10("full");
+  if (full >= PSI_FULL_CRITICAL || some >= PSI_SOME_CRITICAL) return "critical";
+  if (some >= PSI_SOME_WARN || full >= PSI_FULL_WARN) return "warn";
+  return null;
+}
+
 function rate(current: number, previous: number, elapsedMs: number, pageSize: number): number {
   // A counter that went backwards means the machine rebooted or the cursor is
   // from a previous plugin load. Report nothing rather than a fabricated spike.
@@ -166,9 +192,10 @@ export function parseMeminfo(text: string): Map<string, number> {
 }
 
 async function sampleLinux(previous: RateCursor | null): Promise<SampleResult> {
-  const [meminfoText, vmstatText] = await Promise.all([
+  const [meminfoText, vmstatText, psiText] = await Promise.all([
     readFile("/proc/meminfo", "utf8"),
     readFile("/proc/vmstat", "utf8").catch(() => ""),
+    readFile("/proc/pressure/memory", "utf8").catch(() => ""),
   ]);
   const info = parseMeminfo(meminfoText);
   const get = (key: string): number => info.get(key) ?? 0;
@@ -220,7 +247,7 @@ async function sampleLinux(previous: RateCursor | null): Promise<SampleResult> {
       swapOutRate:
         previous === null ? 0 : rate(cursor.swapOutPages, previous.swapOutPages, elapsedMs, 4096),
       compressionRatio: 1,
-      kernelPressure: null,
+      kernelPressure: parsePsiPressure(psiText),
     },
   };
 }

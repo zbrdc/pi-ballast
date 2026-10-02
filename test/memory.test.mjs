@@ -12,6 +12,7 @@ import { platform } from "node:os";
 import {
   parseKernelPressure,
   parseMeminfo,
+  parsePsiPressure,
   parseSwapUsage,
   parseVmStat,
   sampleMemory,
@@ -69,6 +70,38 @@ test("parseKernelPressure maps the sysctl ladder, and refuses to guess", () => {
   assert.equal(parseKernelPressure("kern.memorystatus_vm_pressure_level: 4"), "critical");
   assert.equal(parseKernelPressure(""), null);
   assert.equal(parseKernelPressure("unknown oid"), null);
+});
+
+const psi = (someAvg10, fullAvg10) =>
+  `some avg10=${someAvg10} avg60=0.00 avg300=0.10 total=1814901972\n` +
+  `full avg10=${fullAvg10} avg60=0.00 avg300=0.00 total=1500000000\n`;
+
+test("parsePsiPressure grades avg10 and stays quiet when nothing stalls", () => {
+  assert.equal(parsePsiPressure(psi("0.10", "0.00")), null);
+  assert.equal(parsePsiPressure(psi("9.99", "2.49")), null);
+});
+
+test("parsePsiPressure warns on some >= 10 or full >= 2.5", () => {
+  assert.equal(parsePsiPressure(psi("10.00", "0.00")), "warn");
+  assert.equal(parsePsiPressure(psi("0.00", "2.50")), "warn");
+  assert.equal(parsePsiPressure(psi("39.99", "9.99")), "warn");
+});
+
+test("parsePsiPressure is critical on some >= 40 or full >= 10", () => {
+  assert.equal(parsePsiPressure(psi("40.00", "0.00")), "critical");
+  assert.equal(parsePsiPressure(psi("0.00", "10.00")), "critical");
+});
+
+test("parsePsiPressure reads only avg10, not the slower windows", () => {
+  const text = "some avg10=0.00 avg60=50.00 avg300=50.00 total=1\nfull avg10=0.00 avg60=20.00 avg300=20.00 total=1\n";
+  assert.equal(parsePsiPressure(text), null);
+});
+
+test("parsePsiPressure handles missing lines and garbage without throwing", () => {
+  assert.equal(parsePsiPressure(""), null);
+  assert.equal(parsePsiPressure("not psi"), null);
+  assert.equal(parsePsiPressure("some avg10=45.00 avg60=0 avg300=0 total=1\n"), "critical");
+  assert.equal(parsePsiPressure("full avg10=3.00 avg60=0 avg300=0 total=1\n"), "warn");
 });
 
 test("parseMeminfo converts kB to bytes", () => {
