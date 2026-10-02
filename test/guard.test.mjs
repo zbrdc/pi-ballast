@@ -382,3 +382,51 @@ test("steer is delivered through sendSteer", async () => {
     await cleanup(h.dir);
   }
 });
+
+/**
+ * Leadership handover. The follower starts holding a foreign lock; its first
+ * sample frees the lock and rewrites the shared "last-level", as the old
+ * leader would have, so the second iteration takes over.
+ */
+const takeover = async ({ local, shared, levels }) => {
+  const h = await harness({ follower: true });
+  h.engine.store.setMeta("last-level", local);
+  const controller = new AbortController();
+  let i = 0;
+  h.engine.readPressure = async () => {
+    if (i === 0) {
+      h.engine.store.setMeta("last-level", shared);
+      rmSync(lockPathFor(join(h.dir, "state.json")), { force: true });
+    }
+    if (i >= levels.length) controller.abort();
+    return pressureOf(levels[Math.min(i++, levels.length - 1)]);
+  };
+  const snap = snapOf();
+  h.engine.snapshot = async () => snap;
+  h.engine.makePlan = async () => ({ plan: planOf([]), snap });
+  await h.engine.runGuard(controller.signal, () => {}, h.hooks);
+  return h;
+};
+
+const observedRows = (h) => h.engine.events(20).filter((e) => e.action === "observed");
+
+test("takeover: a change the old leader already recorded is not recorded twice", async () => {
+  const h = await takeover({ local: "ok", shared: "warn", levels: ["ok", "warn", "warn", "warn"] });
+  try {
+    assert.equal(observedRows(h).length, 0, "the shared record already says warn");
+    assert.equal(h.engine.store.getMeta("last-level"), "warn");
+  } finally {
+    await cleanup(h.dir);
+  }
+});
+
+test("takeover: a change the old leader never recorded is recorded once", async () => {
+  const h = await takeover({ local: "warn", shared: "ok", levels: ["warn", "warn", "warn", "warn"] });
+  try {
+    const rows = observedRows(h);
+    assert.equal(rows.length, 1, "the shared record said ok, so warn is news");
+    assert.equal(h.engine.store.getMeta("last-level"), "warn");
+  } finally {
+    await cleanup(h.dir);
+  }
+});

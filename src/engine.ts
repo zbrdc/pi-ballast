@@ -764,14 +764,50 @@ export class Engine {
     this.escalateRung(config, level, plan, snap, pressure, hooks);
   }
 
+  private adoptSharedLevel(state: LevelTransition): LevelTransition {
+    const shared = this.store.getMeta<PressureLevel>("last-level");
+    return { lastLevel: shared ?? state.lastLevel, pendingLevel: null };
+  }
+
+  /**
+   * A level change has to survive one more sample before it counts.
+   * Without this, a single burst of paging writes a critical/warn pair
+   * into the log every couple of minutes.
+   */
+  private noteTransition(
+    state: LevelTransition,
+    pressure: Pressure,
+    leads: boolean,
+    log: (message: string) => void,
+  ): LevelTransition {
+    const { lastLevel, pendingLevel } = state;
+    const level = pressure.level;
+    if (level === lastLevel) return { lastLevel, pendingLevel: null };
+    if (level !== pendingLevel) return { lastLevel, pendingLevel: level };
+    // The event log and "last-level" are machine-shared, so only the
+    // leader writes them. Every session observes the same transition;
+    // letting each record it put duplicate rows at the same millisecond.
+    // Followers still track the level locally and still log.
+    if (leads) {
+      if (lastLevel !== null || level !== "ok") {
+        this.record(pressure, "observed", pressure.reason);
+      }
+      this.store.setMeta("last-level", level);
+    }
+    log(`pressure ${lastLevel ?? "unknown"} → ${level}: ${pressure.reason}`);
+    return { lastLevel: level, pendingLevel: null };
+  }
+
   async runGuard(
     signal: AbortSignal,
     log: (message: string) => void,
     hooks: GuardHooks = realHooks,
   ): Promise<void> {
     const steerState = { steered: false };
-    let lastLevel = this.store.getMeta<PressureLevel>("last-level");
-    let pendingLevel: PressureLevel | null = null;
+    let transition: LevelTransition = {
+      lastLevel: this.store.getMeta<PressureLevel>("last-level"),
+      pendingLevel: null,
+    };
     let lastStatus: string | undefined;
     let lock: LockHandle | null = null;
 
@@ -785,7 +821,14 @@ export class Engine {
         // just does not act. It retries each iteration, so the guard survives
         // the session that started it being closed.
         if (lock !== null && !(await lock.touch())) lock = null;
+        const ledBefore = lock !== null;
         if (lock === null) lock = await acquireLock(lockPathFor(this.statePath));
+        // A follower's local level can disagree with what the old leader last
+        // wrote to the shared record (it died before recording, or recorded
+        // after this session already saw the change). The new leader judges
+        // transitions against that record, so one "observed" is neither
+        // missed nor doubled at the handover.
+        if (!ledBefore && lock !== null) transition = this.adoptSharedLevel(transition);
 
         // Tier one: totals only. Two short-lived reads, no process table —
         // a few milliseconds. This is all a healthy machine ever pays, and it
@@ -798,30 +841,7 @@ export class Engine {
         if (lock !== null) await this.pollOomKills(pressure, hooks, Date.now());
         lastStatus = this.publishStatus(pressure, hooks, lastStatus);
 
-        // A level change has to survive one more sample before it counts.
-        // Without this, a single burst of paging writes a critical/warn pair
-        // into the log every couple of minutes.
-        if (level !== lastLevel) {
-          if (level === pendingLevel) {
-            // The event log and "last-level" are machine-shared, so only the
-            // leader writes them. Every session observes the same transition;
-            // letting each record it put duplicate rows at the same millisecond.
-            // Followers still track the level locally and still log.
-            if (lock !== null) {
-              if (lastLevel !== null || level !== "ok") {
-                this.record(pressure, "observed", pressure.reason);
-              }
-              this.store.setMeta("last-level", level);
-            }
-            log(`pressure ${lastLevel ?? "unknown"} → ${level}: ${pressure.reason}`);
-            lastLevel = level;
-            pendingLevel = null;
-          } else {
-            pendingLevel = level;
-          }
-        } else {
-          pendingLevel = null;
-        }
+        transition = this.noteTransition(transition, pressure, lock !== null, log);
 
         if (level === "ok") {
           // Only the leader can have paused anything. A follower sampling an
@@ -876,6 +896,12 @@ export class Engine {
     // which no other session could act at all.
     await lock?.release();
   }
+}
+
+/** Debounce state for level changes: what was last accepted, and what is awaiting a second sample. */
+interface LevelTransition {
+  lastLevel: PressureLevel | null;
+  pendingLevel: PressureLevel | null;
 }
 
 function usedFractionOf(pressure: Pressure): number {
