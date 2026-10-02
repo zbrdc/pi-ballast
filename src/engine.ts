@@ -305,7 +305,11 @@ export class Engine {
       swapInRate: this.smooth(this.recentSwapIn, sample.swapInRate),
       swapOutRate: this.smooth(this.recentSwapOut, sample.swapOutRate),
     };
-    const pressure = evaluatePressure(smoothed, config.thresholds);
+    const pressure = evaluatePressure(
+      smoothed,
+      config.thresholds,
+      this.lastPressure?.level ?? null,
+    );
     this.lastPressure = pressure;
     return pressure;
   }

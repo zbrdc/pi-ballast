@@ -205,6 +205,63 @@ test("the reason names the signal that decided, and every signal is listed", () 
   assert.equal(pressure.signals[0].level, "critical");
 });
 
+const GB = 1024 ** 3;
+const MB_PER_MIN = (mb) => (mb * 1024 ** 2) / 60;
+
+test("headroom just past the warn line holds warn; well past it drops", () => {
+  // warn line is 2 GB at the default 3 GB floor; release line is 2.2 GB.
+  const holding = evaluatePressure(sample({ headroomBytes: 2.1 * GB }), DEFAULT_THRESHOLDS, "warn");
+  assert.equal(holding.level, "warn");
+  assert.match(holding.reason, /holding until clear/);
+
+  const cleared = evaluatePressure(sample({ headroomBytes: 2.5 * GB }), DEFAULT_THRESHOLDS, "warn");
+  assert.equal(cleared.level, "watch", "never below the raw level, never above the held one");
+  assert.doesNotMatch(cleared.reason, /holding/);
+
+  const near = evaluatePressure(sample({ headroomBytes: 3.2 * GB }), DEFAULT_THRESHOLDS, "watch");
+  assert.equal(near.level, "watch", "3.2 GB is past the 3 GB line but inside the 3.3 GB release line");
+  const gone = evaluatePressure(sample({ headroomBytes: 3.4 * GB }), DEFAULT_THRESHOLDS, "watch");
+  assert.equal(gone.level, "ok");
+});
+
+test("no previous level grades exactly as before", () => {
+  const input = sample({ headroomBytes: 2.1 * GB });
+  assert.equal(evaluatePressure(input, DEFAULT_THRESHOLDS).level, "watch");
+  assert.equal(evaluatePressure(input, DEFAULT_THRESHOLDS, null).level, "watch");
+});
+
+test("escalation ignores the previous level", () => {
+  const pressure = evaluatePressure(sample({ headroomBytes: 0.7 * GB }), DEFAULT_THRESHOLDS, "ok");
+  assert.equal(pressure.level, "critical");
+  assert.doesNotMatch(pressure.reason, /holding/);
+});
+
+test("a swap rate just under the warn line holds warn", () => {
+  // warn at 200 MB/min; release at 180 MB/min.
+  const holding = evaluatePressure(
+    sample({ swapInRate: MB_PER_MIN(190) }),
+    DEFAULT_THRESHOLDS,
+    "warn",
+  );
+  assert.equal(holding.level, "warn");
+  assert.match(holding.reason, /paging in/);
+
+  const cleared = evaluatePressure(
+    sample({ swapInRate: MB_PER_MIN(100) }),
+    DEFAULT_THRESHOLDS,
+    "warn",
+  );
+  assert.equal(cleared.level, "watch");
+});
+
+test("percent used holds watch within 3 points of the line, then drops", () => {
+  const percentSample = (percent) => sample({ usedBytes: (24 * GB * percent) / 100 });
+  const holding = evaluatePressure(percentSample(74), DEFAULT_THRESHOLDS, "watch");
+  assert.equal(holding.level, "watch");
+  const dropped = evaluatePressure(percentSample(71), DEFAULT_THRESHOLDS, "watch");
+  assert.equal(dropped.level, "ok");
+});
+
 test("worst() orders the ladder", () => {
   assert.equal(worst("ok", "watch"), "watch");
   assert.equal(worst("critical", "warn"), "critical");

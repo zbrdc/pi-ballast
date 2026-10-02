@@ -98,21 +98,68 @@ function gradeKernel(sample: MemorySample): Signal | null {
   return null;
 }
 
-export function evaluatePressure(sample: MemorySample, thresholds: Thresholds): Pressure {
+// Release margin: a level only clears once the signal has recovered this far
+// past its line, so a reading hovering on a threshold does not flap the level
+// (and every banner, steer and brief that follows it) on each sample.
+export const HYSTERESIS = 0.1;
+// Percent used is already capped at "watch", so its release margin is fixed
+// points rather than a ratio.
+export const WATCH_PERCENT_RELEASE_POINTS = 3;
+
+/** The thresholds a signal must clear to step down from a held level. */
+function releaseThresholds(thresholds: Thresholds): Thresholds {
+  return {
+    watchPercent: thresholds.watchPercent - WATCH_PERCENT_RELEASE_POINTS,
+    minHeadroomGb: thresholds.minHeadroomGb * (1 + HYSTERESIS),
+    swapRateMbPerMin: thresholds.swapRateMbPerMin * (1 - HYSTERESIS),
+  };
+}
+
+// Kernel PSI is not re-graded for release: avg10 is already smoothed.
+function gradeAll(sample: MemorySample, thresholds: Thresholds): Signal[] {
   const signals = [
     gradeKernel(sample),
     gradeHeadroom(sample, thresholds),
     gradeSwapRate(sample, thresholds),
     gradePercent(sample, thresholds),
   ].filter((signal): signal is Signal => signal !== null);
+  return signals.sort((a, b) => ORDER[b.level] - ORDER[a.level]);
+}
 
-  signals.sort((a, b) => ORDER[b.level] - ORDER[a.level]);
-  const level = signals.reduce<PressureLevel>((acc, signal) => worst(acc, signal.level), "ok");
+function levelOf(signals: Signal[]): PressureLevel {
+  return signals.length === 0 ? "ok" : signals[0].level;
+}
+
+/**
+ * Escalation is immediate. De-escalation is held: when the raw level is below
+ * `previous`, the level only drops as far as the release-threshold grading
+ * allows, and never below the raw level.
+ */
+export function evaluatePressure(
+  sample: MemorySample,
+  thresholds: Thresholds,
+  previous: PressureLevel | null = null,
+): Pressure {
+  const rawSignals = gradeAll(sample, thresholds);
+  const raw = levelOf(rawSignals);
+  let signals = rawSignals;
+  let level = raw;
+  let holding = false;
+
+  if (previous !== null && ORDER[raw] < ORDER[previous]) {
+    const held = gradeAll(sample, releaseThresholds(thresholds));
+    const heldLevel = levelOf(held);
+    level = ORDER[heldLevel] < ORDER[previous] ? heldLevel : previous;
+    holding = level !== raw;
+    if (holding) signals = held;
+  }
 
   const reason =
     signals.length === 0
       ? `${formatBytes(sample.headroomBytes)} headroom, no swap activity`
-      : signals[0].detail;
+      : holding
+        ? `${signals[0].detail} (holding until clear)`
+        : signals[0].detail;
 
   return { sample, level, reason, signals, thresholds };
 }
