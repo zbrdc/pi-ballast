@@ -1,8 +1,16 @@
 {
   "name": "pi-ballast",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Physical memory pressure for pi — TUI stats, per-project attribution, and a graded intervention ladder.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zbrdc/pi-ballast.git"
+  },
+  "homepage": "https://github.com/zbrdc/pi-ballast#readme",
+  "bugs": {
+    "url": "https://github.com/zbrdc/pi-ballast/issues"
+  },
   "type": "module",
   "keywords": [
     "pi",
@@ -23,8 +31,12 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "pi": {
-    "extensions": ["./src/index.ts"],
-    "skills": ["./skills"]
+    "extensions": [
+      "./src/index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
