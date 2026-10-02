@@ -6,6 +6,7 @@
  * authorized candidates, steer = a message into the session whose project is
  * holding the memory, escalate = a headless pi working the relief plan.
  */
+import { availableParallelism } from "node:os";
 import type {
   Candidate,
   Config,
@@ -24,7 +25,7 @@ import { evaluatePressure } from "./lib/pressure";
 import { applyRelief, buildPlan } from "./lib/relieve";
 import { acquireLock, lockPathFor, type LockHandle } from "./lib/lock";
 import { Store } from "./lib/store";
-import { formatBytes } from "./lib/format";
+import { formatBytes, formatRate } from "./lib/format";
 
 /** Rate smoothing window, in samples. 3 = one bad reading cannot trip a swap signal. */
 const RATE_WINDOW = 3;
@@ -89,27 +90,49 @@ function topConsumerLine(top: TopConsumer): string {
 }
 
 /**
+ * A typical rustc/tsc/clang job peaks around 1-2 GB; budgeting 2 GiB per job
+ * keeps a parallel build from spending the headroom it was told is left.
+ */
+const BYTES_PER_JOB = 2 * 1024 ** 3;
+
+/** Parallel jobs the current headroom supports: at least 1, at most the CPU count. */
+export function parallelBudget(headroomBytes: number, cpus = availableParallelism()): number {
+  const jobs = Math.floor(headroomBytes / BYTES_PER_JOB);
+  return Math.max(1, Math.min(jobs, Math.max(1, cpus)));
+}
+
+function budgetLines(headroomBytes: number, cpus: number | undefined): string[] {
+  const jobs = parallelBudget(headroomBytes, cpus);
+  return [
+    `Budget for new work: ~${jobs} parallel jobs (e.g. make -j${jobs}, cargo build -j${jobs}, --test-threads=${jobs}). Run test suites serially if they launch browsers.`,
+    "Use ballast_plan before stopping anything you did not start.",
+  ];
+}
+
+/**
  * The brief injected into the model's context on every request while
  * pressure is elevated — the pi equivalent of BB's contributeInstructions.
  * Returns null when there is nothing worth saying: level ok, or a reading
- * too stale to trust.
+ * too stale to trust. Watch carries the numbers only; advice starts at warn
+ * so a merely busy machine is not nagged on every request.
  */
 export function contextBrief(
   pressure: Pressure,
   now = Date.now(),
   top?: TopConsumer | null,
+  cpus?: number,
 ): string | null {
   if (pressure.level === "ok") return null;
   if (now - pressure.sample.atMs > CONTEXT_STALE_MS) return null;
   const { sample } = pressure;
   const parts = [`${pressure.level.toUpperCase()} — headroom ${formatBytes(sample.headroomBytes)}`];
-  if (sample.swapInRate > 0) parts.push(`paging in ${formatBytes(sample.swapInRate)}/min`);
+  if (sample.swapInRate > 0) parts.push(`paging in ${formatRate(sample.swapInRate)}`);
   parts.push(`sampled ${Math.max(0, Math.round((now - sample.atMs) / 1000))}s ago`);
   return [
     "Note from ballast, the memory monitor (automatic status, not a user message):",
     `Memory pressure ${parts.join(", ")}.`,
     ...(top ? [topConsumerLine(top)] : []),
-    "Prefer serial over parallel builds and tests. Close browsers and dev servers you started and no longer need. Use ballast_plan before stopping anything you did not start.",
+    ...(pressure.level === "watch" ? [] : budgetLines(sample.headroomBytes, cpus)),
   ].join("\n");
 }
 

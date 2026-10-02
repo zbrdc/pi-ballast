@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { contextBrief, Engine } from "../src/engine.ts";
+import { contextBrief, Engine, parallelBudget } from "../src/engine.ts";
 import { DEFAULT_THRESHOLDS } from "../src/lib/pressure.ts";
 import ballast from "../src/index.ts";
 
@@ -28,6 +28,15 @@ const pressureOf = (over = {}) => ({
     compressionRatio: 1,
     kernelPressure: 0,
   },
+  ...over,
+});
+const topOf = (over = {}) => ({
+  label: "strata",
+  kind: "other",
+  bytes: 43 * GB,
+  threadId: null,
+  atMs: Date.now(),
+  fraction: 43 / 62,
   ...over,
 });
 const sampleOver = (pressure, over) => ({
@@ -58,8 +67,35 @@ test("paging shows up when swap-in is active", () => {
   assert.ok(contextBrief(paging).includes("paging in"));
 });
 
-test("watch counts as elevated", () => {
-  assert.ok(contextBrief(pressureOf({ level: "watch" })) !== null);
+test("watch counts as elevated but carries no advice", () => {
+  const brief = contextBrief(pressureOf({ level: "watch" }), Date.now(), topOf());
+  assert.ok(brief.includes("WATCH"));
+  assert.ok(brief.includes("Largest consumer"));
+  assert.ok(!brief.includes("Budget for new work"));
+  assert.ok(!brief.includes("ballast_plan"));
+});
+
+test("warn and critical carry the budget and the plan pointer", () => {
+  for (const level of ["warn", "critical"]) {
+    const brief = contextBrief(pressureOf({ level }), Date.now(), null, 8);
+    assert.ok(brief.includes("Budget for new work: ~1 parallel jobs (e.g. make -j1"));
+    assert.ok(brief.includes("Use ballast_plan before stopping anything you did not start."));
+    assert.ok(!brief.includes("Close browsers"));
+  }
+});
+
+test("paging rate is per minute from a per-second sample", () => {
+  const paging = sampleOver(pressureOf(), { swapInRate: 1024 ** 2 });
+  assert.ok(contextBrief(paging).includes("paging in 60.0 MB/min"));
+});
+
+test("parallel budget clamps between 1 and the cpu count", () => {
+  assert.equal(parallelBudget(0.5 * GB, 16), 1);
+  assert.equal(parallelBudget(0, 16), 1);
+  assert.equal(parallelBudget(7 * GB, 16), 3);
+  assert.equal(parallelBudget(512 * GB, 8), 8);
+  assert.equal(parallelBudget(512 * GB, 0), 1);
+  assert.ok(parallelBudget(512 * GB) >= 1);
 });
 
 const makePi = () => {
@@ -95,16 +131,6 @@ test("context handler leaves the transcript alone when ok", () => {
   } finally {
     Engine.prototype.lastReading = original;
   }
-});
-
-const topOf = (over = {}) => ({
-  label: "strata",
-  kind: "other",
-  bytes: 43 * GB,
-  threadId: null,
-  atMs: Date.now(),
-  fraction: 43 / 62,
-  ...over,
 });
 
 test("brief names the top consumer outside any project", () => {
