@@ -40,7 +40,7 @@ The guard acts in this order:
 
 A candidate is rechecked against the live process table before a signal is sent. Editors, interactive browsers, agents, pi itself, other users' processes, protected ports, and processes younger than one minute are not stopped.
 
-While pressure is elevated, each model request also receives a short, automatic status note: free memory and swap-in rate, the largest consumer, how many parallel build or test jobs the headroom allows (about 2 GiB each), and any recent kernel OOM kills. The note is request-local and does not become part of the conversation history.
+At `warn` or `critical`, the model receives a short, automatic status note: free memory and swap-in rate, the largest consumer, how many parallel build or test jobs the headroom allows (about 2 GiB each), and any recent kernel OOM kills. The note goes out when the level changes or a new OOM kill appears, and at most every 10 minutes while nothing changes; `watch` alone sends nothing. The note is request-local and does not become part of the conversation history.
 
 ### Pressure levels
 

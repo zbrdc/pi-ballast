@@ -7,7 +7,14 @@ import { test } from "node:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { contextBrief, Engine, parallelBudget } from "../src/engine.ts";
+import {
+  BRIEF_REPEAT_MS,
+  BriefGate,
+  briefGist,
+  contextBrief,
+  Engine,
+  parallelBudget,
+} from "../src/engine.ts";
 import { DEFAULT_THRESHOLDS } from "../src/lib/pressure.ts";
 import ballast from "../src/index.ts";
 
@@ -67,12 +74,38 @@ test("paging shows up when swap-in is active", () => {
   assert.ok(contextBrief(paging).includes("paging in"));
 });
 
-test("watch counts as elevated but carries no advice", () => {
-  const brief = contextBrief(pressureOf({ level: "watch" }), Date.now(), topOf());
-  assert.ok(brief.includes("WATCH"));
-  assert.ok(brief.includes("Largest consumer"));
-  assert.ok(!brief.includes("Budget for new work"));
-  assert.ok(!brief.includes("ballast_plan"));
+test("watch stays silent: a busy machine is not news", () => {
+  assert.equal(contextBrief(pressureOf({ level: "watch" }), Date.now(), topOf()), null);
+});
+
+test("watch still reports a recent OOM kill", () => {
+  const kill = { atMs: Date.now() - 60_000, pid: 42, name: "node", rssBytes: GB };
+  const brief = contextBrief(pressureOf({ level: "watch" }), Date.now(), null, { kills: [kill] });
+  assert.ok(brief && brief.includes("node"));
+});
+
+test("brief gist tracks level and newest kill, not drifting numbers", () => {
+  const now = Date.now();
+  assert.equal(briefGist(pressureOf({ level: "ok" }), now), null);
+  assert.equal(briefGist(pressureOf({ level: "watch" }), now), null);
+  const a = briefGist(pressureOf(), now);
+  const b = briefGist(sampleOver(pressureOf(), { headroomBytes: 1.5 * GB }), now);
+  assert.equal(a, b);
+  assert.notEqual(a, briefGist(pressureOf({ level: "critical" }), now));
+  const kill = { atMs: now - 1000, pid: 1, name: "x", rssBytes: GB };
+  assert.equal(briefGist(pressureOf({ level: "watch" }), now, [kill]), `quiet:${kill.atMs}`);
+});
+
+test("brief gate sends on change or after the repeat interval only", () => {
+  const gate = new BriefGate();
+  const t = 1_000_000;
+  assert.equal(gate.admit("warn:0", t), true);
+  assert.equal(gate.admit("warn:0", t + 1000), false);
+  assert.equal(gate.admit("warn:0", t + BRIEF_REPEAT_MS - 1), false);
+  assert.equal(gate.admit("warn:0", t + BRIEF_REPEAT_MS), true);
+  assert.equal(gate.admit("critical:0", t + BRIEF_REPEAT_MS + 1), true);
+  assert.equal(gate.admit(null, t + BRIEF_REPEAT_MS + 2), false);
+  assert.equal(gate.admit("critical:0", t + BRIEF_REPEAT_MS + 3), true);
 });
 
 test("warn and critical carry the budget and the plan pointer", () => {
@@ -124,6 +157,24 @@ test("context handler appends one status message when elevated", () => {
     assert.equal(injected.role, "user");
     assert.ok(injected.content.includes("WARN"));
     assert.equal(typeof injected.timestamp, "number");
+  } finally {
+    Engine.prototype.lastReading = original;
+  }
+});
+
+test("context handler does not repeat an unchanged brief on the next request", () => {
+  const pi = makePi();
+  ballast(pi);
+  const original = Engine.prototype.lastReading;
+  try {
+    let level = "warn";
+    Engine.prototype.lastReading = () => pressureOf({ level });
+    const call = () => pi.handlers.context({ type: "context", messages: [] });
+    assert.equal(call().messages.length, 1);
+    assert.equal(call(), undefined);
+    level = "critical";
+    assert.ok(call().messages[0].content.includes("CRITICAL"));
+    assert.equal(call(), undefined);
   } finally {
     Engine.prototype.lastReading = original;
   }

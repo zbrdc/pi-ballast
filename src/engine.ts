@@ -143,13 +143,14 @@ function killLines(kills: OomKill[], now: number): string[] {
 }
 
 /**
- * The brief injected into the model's context on every request while
- * pressure is elevated — the pi equivalent of BB's contributeInstructions.
- * Returns null when there is nothing worth saying: level ok with no recent
- * kernel kill, or a reading too stale to trust. Watch carries the numbers
- * only; advice starts at warn so a merely busy machine is not nagged on every
- * request. A recent OOM kill is reported even at ok: the machine has
- * recovered, but the agent's failed command still needs explaining.
+ * The brief the model may receive while pressure is warn or critical — the
+ * pi equivalent of BB's contributeInstructions. Returns null when there is
+ * nothing worth saying: level ok or watch with no recent kernel kill, or a
+ * reading too stale to trust. Watch is silent because a machine can sit there
+ * for days (a large model server) and there is nothing the agent should do
+ * differently. A recent OOM kill is reported at any level: the machine may
+ * have recovered, but the agent's failed command still needs explaining.
+ * BriefGate decides how often a non-null brief is actually sent.
  */
 export function contextBrief(
   pressure: Pressure,
@@ -171,8 +172,7 @@ function pressureLines(
   top: TopConsumer | null | undefined,
   cpus: number | undefined,
 ): string[] {
-  if (pressure.level === "ok") return [];
-  if (now - pressure.sample.atMs > CONTEXT_STALE_MS) return [];
+  if (!isAdvisory(pressure, now)) return [];
   const { sample } = pressure;
   const parts = [`${pressure.level.toUpperCase()} — headroom ${formatBytes(sample.headroomBytes)}`];
   if (sample.swapInRate > 0) parts.push(`paging in ${formatRate(sample.swapInRate)}`);
@@ -180,8 +180,52 @@ function pressureLines(
   return [
     `Memory pressure ${parts.join(", ")}.`,
     ...(top ? [topConsumerLine(top)] : []),
-    ...(pressure.level === "watch" ? [] : budgetLines(sample.headroomBytes, cpus)),
+    ...budgetLines(sample.headroomBytes, cpus),
   ];
+}
+
+function isAdvisory(pressure: Pressure, now: number): boolean {
+  if (pressure.level === "ok" || pressure.level === "watch") return false;
+  return now - pressure.sample.atMs <= CONTEXT_STALE_MS;
+}
+
+/** A brief whose gist has not changed is resent at most this often. */
+export const BRIEF_REPEAT_MS = 10 * 60_000;
+
+/**
+ * What a brief is about, ignoring numbers that drift every sample: the level
+ * and the newest recent OOM kill. Null when there is no brief to send.
+ */
+export function briefGist(pressure: Pressure, now: number, kills: OomKill[] = []): string | null {
+  const level = isAdvisory(pressure, now) ? pressure.level : "quiet";
+  const newest = kills
+    .filter((kill) => now - kill.atMs <= OOM_WINDOW_MS)
+    .reduce((max, kill) => Math.max(max, kill.atMs), 0);
+  if (level === "quiet" && newest === 0) return null;
+  return `${level}:${newest}`;
+}
+
+/**
+ * Rate-limits the brief. The context hook runs on every model request, often
+ * several per user turn; repeating an unchanged note each time spends tokens
+ * and nags. A brief goes out when its gist changes or BRIEF_REPEAT_MS has
+ * passed since it was last sent; a null gist resets the gate so the next rise
+ * is reported at once.
+ */
+export class BriefGate {
+  private lastGist: string | null = null;
+  private lastSentMs = 0;
+
+  admit(gist: string | null, now = Date.now()): boolean {
+    if (gist === null) {
+      this.lastGist = null;
+      return false;
+    }
+    if (gist === this.lastGist && now - this.lastSentMs < BRIEF_REPEAT_MS) return false;
+    this.lastGist = gist;
+    this.lastSentMs = now;
+    return true;
+  }
 }
 
 /** Rung side effects, injectable so tests never touch real processes. */

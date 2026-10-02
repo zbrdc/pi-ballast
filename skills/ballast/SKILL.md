@@ -47,9 +47,10 @@ and the rest only sample and report — except steer, which the session holding
 the memory runs for itself. A steer message you see is therefore always about
 your own project, never about someone else's.
 
-Alongside the rungs, live memory status is injected into the model's context
-while pressure is elevated — a labelled one-liner, restored out of the
-transcript after each request. If a user turn seems to be preceded by a note
+Alongside the rungs, a labelled memory status note is injected into the
+model's context at warn or critical — when the level changes, when a new OOM
+kill appears, and otherwise at most every 10 minutes. It is request-local and
+never enters the transcript. If a user turn seems to be preceded by a note
 about headroom or paging, that is ballast, not the user.
 
 Before diagnosing a hung or stopped build as broken, check the activity trail:

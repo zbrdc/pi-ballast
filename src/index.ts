@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { contextBrief, defaultConfig, Engine } from "./engine";
+import { BriefGate, briefGist, contextBrief, defaultConfig, Engine } from "./engine";
 import { BallastPanel, type PanelAction, type PanelState } from "./panel";
 import { renderConsumers, renderPlan, renderPressure } from "./render";
 import type { AutoRelieve } from "./lib/contract";
@@ -27,6 +27,7 @@ const silentLog = (_message: string): void => {};
 
 export default function ballast(pi: ExtensionAPI) {
   const engine = new Engine(STATE_PATH);
+  const briefGate = new BriefGate();
   let guardAbort: AbortController | null = null;
   // An escalation worker is a guest, not a host. Its tools and its context
   // injection still work; it just never runs the machine's guard loop.
@@ -85,9 +86,10 @@ export default function ballast(pi: ExtensionAPI) {
   pi.on("context", (event) => {
     const pressure = engine.lastReading();
     if (!pressure) return;
-    const brief = contextBrief(pressure, Date.now(), engine.topConsumer(), {
-      kills: engine.recentOomKills(),
-    });
+    const now = Date.now();
+    const kills = engine.recentOomKills();
+    if (!briefGate.admit(briefGist(pressure, now, kills), now)) return;
+    const brief = contextBrief(pressure, now, engine.topConsumer(), { kills });
     if (!brief) return;
     return {
       messages: [...event.messages, { role: "user", content: brief, timestamp: Date.now() }],
