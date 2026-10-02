@@ -1,7 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parseConfigCommand } from "../src/lib/config-cmd.ts";
-import { defaultConfig } from "../src/engine.ts";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Engine, defaultConfig } from "../src/engine.ts";
 
 const run = (args, config = defaultConfig()) => parseConfigCommand(args, config, defaultConfig());
 
@@ -40,10 +43,15 @@ test("number type is enforced", () => {
 });
 
 test("nested thresholds key is set without losing siblings", () => {
-  const result = run("config thresholds.criticalPercent 97");
+  const result = run("config thresholds.watchPercent 70");
   assert.equal(result.kind, "set");
-  assert.equal(result.config.thresholds.criticalPercent, 97);
-  assert.equal(result.config.thresholds.warnPercent, 85);
+  assert.equal(result.config.thresholds.watchPercent, 70);
+  assert.equal(result.config.thresholds.minHeadroomGb, 3);
+});
+
+test("retired percent thresholds are unknown keys", () => {
+  assert.equal(run("config thresholds.criticalPercent 97").kind, "error");
+  assert.equal(run("config thresholds.warnPercent 80").kind, "error");
 });
 
 test("enums and digit-only strings", () => {
@@ -69,4 +77,24 @@ test("exempt keeps comment and blank lines", () => {
 
 test("unknown subcommand prints usage", () => {
   assert.equal(run("frobnicate").kind, "error");
+});
+
+test("a stored config with retired percent thresholds loads without them", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ballast-config-"));
+  try {
+    const engine = new Engine(join(dir, "state.json"));
+    await engine.load();
+    engine.store.setMeta("config", {
+      ...defaultConfig(),
+      idleMinutes: 45,
+      thresholds: { watchPercent: 70, warnPercent: 85, criticalPercent: 92, minHeadroomGb: 4 },
+    });
+    const config = engine.readConfig();
+    assert.equal(config.idleMinutes, 45);
+    assert.deepEqual(config.thresholds, { ...defaultConfig().thresholds, watchPercent: 70, minHeadroomGb: 4 });
+    assert.equal("criticalPercent" in config.thresholds, false);
+    assert.equal("warnPercent" in config.thresholds, false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

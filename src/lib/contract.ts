@@ -62,8 +62,6 @@ export interface MemorySample {
 
 export interface Thresholds {
   watchPercent: number;
-  warnPercent: number;
-  criticalPercent: number;
   minHeadroomGb: number;
   swapRateMbPerMin: number;
 }

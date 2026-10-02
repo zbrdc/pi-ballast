@@ -50,7 +50,7 @@ sqlite3 ~/.pi/agent/ballast-state.db \
    UPDATE meta SET value=json_set(value,'$.throttle','safe') WHERE key='config';"
 ```
 
-Defaults: `autoRelieve: off`, `throttle: off`, `steer: true`, `escalate: false`; watch/warn/critical thresholds are 75/85/92% used, with a 3 GB minimum-headroom threshold.
+Defaults: `autoRelieve: off`, `throttle: off`, `steer: true`, `escalate: false`; watch at 75% used; warn/critical come from headroom (3 GB minimum), swap-in rate, and kernel PSI.
 
 ## Develop
 

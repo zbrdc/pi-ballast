@@ -14,12 +14,10 @@
 import type { MemorySample, Pressure, PressureLevel, Thresholds } from "./contract";
 import { formatBytes, formatPercent, formatRate } from "./format";
 
-// warnPercent and criticalPercent no longer escalate (percent is capped at
-// "watch"); they stay so configs stored by earlier versions still parse.
+// Percent used only ever reaches "watch": a full-but-idle page cache is not
+// pressure. warn/critical come from headroom, paging rate and kernel PSI.
 export const DEFAULT_THRESHOLDS: Thresholds = {
   watchPercent: 75,
-  warnPercent: 85,
-  criticalPercent: 92,
   minHeadroomGb: 3,
   swapRateMbPerMin: 200,
 };

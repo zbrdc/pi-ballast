@@ -21,7 +21,7 @@ import type { RateCursor } from "./lib/memory";
 import { attributeByPiCwd, groupByThread, groupConsumers, readPiCwds, readProcesses } from "./lib/procs";
 import { sampleMemory } from "./lib/memory";
 import { cadenceMs, parseLines, parsePorts } from "./lib/policy";
-import { evaluatePressure } from "./lib/pressure";
+import { DEFAULT_THRESHOLDS, evaluatePressure } from "./lib/pressure";
 import { applyRelief, buildPlan } from "./lib/relieve";
 import { acquireLock, lockPathFor, type LockHandle } from "./lib/lock";
 import { oomDetail, parseOomDetail, readOomKills, type OomKill } from "./lib/oom";
@@ -207,13 +207,7 @@ const realHooks: GuardHooks = {
 
 export function defaultConfig(): Config {
   return {
-    thresholds: {
-      watchPercent: 75,
-      warnPercent: 85,
-      criticalPercent: 92,
-      minHeadroomGb: 3,
-      swapRateMbPerMin: 200,
-    },
+    thresholds: { ...DEFAULT_THRESHOLDS },
     sampleSeconds: 10,
     protectedPorts: "",
     exemptPatterns: "",
@@ -278,7 +272,11 @@ export class Engine {
     const saved = this.store.getMeta<Partial<Config>>("config");
     if (saved === null) return defaultConfig();
     // Merge over defaults so a config saved by an older version still loads.
-    return { ...defaultConfig(), ...saved, thresholds: { ...defaultConfig().thresholds, ...saved.thresholds } };
+    const defaults = defaultConfig();
+    // Keep only live keys: retired ones (warnPercent, criticalPercent) would
+    // otherwise show up in /ballast config as settings that do nothing.
+    const kept = Object.entries(saved.thresholds ?? {}).filter(([key]) => key in defaults.thresholds);
+    return { ...defaults, ...saved, thresholds: { ...defaults.thresholds, ...Object.fromEntries(kept) } };
   }
 
   writeConfig(config: Config): void {
