@@ -16,7 +16,9 @@ pi install npm:pi-ballast
 
 ## Use
 
-Run `/ballast` for the TUI panel. Use the arrow keys to select a candidate, `k` to stop it, `s` to cycle automatic relief, and `q` to close the panel.
+Run `/ballast` for the TUI panel. Use the arrow keys to select a candidate, `k` to stop it, `s` to cycle automatic relief, and `q` to close the panel. Outside the TUI, `/ballast` prints the current pressure.
+
+While pressure is above `ok`, the footer status line shows the level, free memory, and the largest consumer, for example `ballast: WARN 2.10 GB free · strata 43.0 GB`.
 
 The agent tools are:
 
@@ -32,25 +34,35 @@ One pi process is elected to run the machine-wide actions. Other sessions still 
 The guard acts in this order:
 
 1. **Throttle** (`off` by default): pause safe candidates with `SIGSTOP` at `warn` or higher. Resume them with `SIGCONT` when pressure clears or the leader exits.
-2. **Steer** (on by default): at `warn` or higher, ask the matching TUI session to close browsers or dev servers it started. Ten-minute cooldown.
+2. **Steer** (on by default): at `warn` or higher, tell a TUI session to stop browser automation, dev servers, or test runners it started, naming each one. It fires only when those processes add up to at least 1 GiB; pi itself, editors, and agents never count. The note arrives as an extension message, not as a user message. Ten-minute cooldown.
 3. **Relieve** (`autoRelieve: off` by default): at `critical`, stop safe candidates; `aggressive` also permits disruptive candidates and starts at `warn`. Two-minute cooldown.
 4. **Escalate** (`off` by default): at `critical`, start a headless pi to work an actionable plan. It waits for a recent relief wave to finish. Twenty-minute cooldown.
 
 A candidate is rechecked against the live process table before a signal is sent. Editors, interactive browsers, agents, pi itself, other users' processes, protected ports, and processes younger than one minute are not stopped.
 
-While pressure is elevated, each model request also receives a short, automatic status note with the latest headroom and paging rate. The note is request-local and does not become part of the conversation history.
+While pressure is elevated, each model request also receives a short, automatic status note: free memory and swap-in rate, the largest consumer, how many parallel build or test jobs the headroom allows (about 2 GiB each), and any recent kernel OOM kills. The note is request-local and does not become part of the conversation history.
+
+### Pressure levels
+
+- `watch`: memory is at least 75% used. Percent used on its own never goes above `watch`; a large, steady model server is not an emergency.
+- `warn` and `critical`: free memory under the 3 GB floor, a high swap-in rate, or kernel memory pressure (PSI on Linux, `kern.memorystatus_vm_pressure_level` on macOS).
+- Levels go up at once. To drop a level, free memory must be 10% past its line, the swap-in rate 10% under its limit, or percent used 3 points under `watch`.
+- On Linux, ballast also reads kernel OOM kills from `journalctl -k`, so a command that exited 137 has an explanation.
 
 ## Configure
 
-State and configuration live in `~/.pi/agent/ballast-state.db`, a SQLite database using Node's built-in `node:sqlite`. The `config` row is JSON. After pi-ballast has created the database, this command enables the safe throttle:
+Edit settings from pi:
 
-```sh
-sqlite3 ~/.pi/agent/ballast-state.db \
-  "INSERT INTO meta(key,value) VALUES('config','{}') ON CONFLICT(key) DO NOTHING;
-   UPDATE meta SET value=json_set(value,'$.throttle','safe') WHERE key='config';"
+```text
+/ballast config                          # print the effective config
+/ballast config throttle safe            # set a key
+/ballast config thresholds.watchPercent 80
+/ballast exempt strata                   # never touch processes matching this pattern
 ```
 
-Defaults: `autoRelieve: off`, `throttle: off`, `steer: true`, `escalate: false`; watch at 75% used; warn/critical come from headroom (3 GB minimum), swap-in rate, and kernel PSI.
+Values are type-checked against the defaults, and settings with a fixed set of values (`throttle`, `autoRelieve`) reject anything else. State and configuration live in `~/.pi/agent/ballast-state.db`, a SQLite database using Node's built-in `node:sqlite`.
+
+Defaults: `autoRelieve: off`, `throttle: off`, `steer: true`, `escalate: false`; watch at 75% used; warn/critical come from headroom (3 GB minimum), swap-in rate, and kernel memory pressure.
 
 ## Develop
 
