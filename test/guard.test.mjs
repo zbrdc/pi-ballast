@@ -76,14 +76,14 @@ const snapOf = () => ({ consumers: [threadConsumer], threads: [threadConsumer], 
  * real; sampling, planning, and the kill itself are patched in. The loop ends
  * when the queue is exhausted.
  */
-const drive = async (engine, levels, hooks) => {
+const drive = async (engine, levels, hooks, consumers = [threadConsumer]) => {
   let i = 0;
   const controller = new AbortController();
   engine.readPressure = async () => {
     if (i >= levels.length) controller.abort();
     return pressureOf(levels[Math.min(i++, levels.length - 1)]);
   };
-  const snap = snapOf();
+  const snap = { ...snapOf(), consumers };
   engine.snapshot = async () => snap;
   engine.makePlan = async () => ({ plan: planOf(), snap });
   engine.runRelief = async () => ({ succeeded: 1, failed: 0, bytesFreed: 1024 ** 3, items: [] });
@@ -314,6 +314,33 @@ test("warn engages throttle and steer but never relief or escalation", async () 
     const actions = h.engine.events(10).map((e) => e.action);
     assert.ok(!actions.includes("relieved") && !actions.includes("escalated"), "no irreversible rung at warn");
     assert.equal(h.engine.store.getMeta("throttle-paused"), null, "leader exit restored its wave");
+  } finally {
+    await cleanup(h.dir);
+  }
+});
+
+test("leader records the largest non-system consumer after its snapshot", async () => {
+  const h = await harness();
+  try {
+    const big = { ...threadConsumer, id: "pid:7", label: "strata", kind: "other", bytes: 8 * 1024 ** 3, threadId: null };
+    const sys = { ...threadConsumer, id: "pid:1", label: "kernel", kind: "system", bytes: 12 * 1024 ** 3, threadId: null };
+    await drive(h.engine, ["critical", "critical"], h.hooks, [threadConsumer, big, sys]);
+    const top = h.engine.store.getMeta("top-consumer");
+    assert.equal(top.label, "strata");
+    assert.equal(top.bytes, 8 * 1024 ** 3);
+    assert.equal(top.threadId, null);
+    assert.equal(top.fraction, 0.5);
+    assert.equal(typeof top.atMs, "number");
+  } finally {
+    await cleanup(h.dir);
+  }
+});
+
+test("a follower never writes the top consumer", async () => {
+  const h = await harness({ follower: true });
+  try {
+    await drive(h.engine, ["critical", "critical"], h.hooks);
+    assert.equal(h.engine.store.getMeta("top-consumer"), null);
   } finally {
     await cleanup(h.dir);
   }

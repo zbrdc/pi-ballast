@@ -69,13 +69,36 @@ function describeSteerItem(c: Consumer): string {
  */
 const CONTEXT_STALE_MS = 2 * 60_000;
 
+/** The biggest thing on the machine when pressure last rose, shared via meta. */
+export interface TopConsumer {
+  label: string;
+  kind: string;
+  bytes: number;
+  threadId: string | null;
+  atMs: number;
+  /** bytes / total RAM, 0..1. */
+  fraction: number;
+}
+
+const TOP_CONSUMER_KEY = "top-consumer";
+
+function topConsumerLine(top: TopConsumer): string {
+  const where = top.threadId === null ? "outside any project" : `in project ${top.threadId}`;
+  const share = Math.round(top.fraction * 100);
+  return `Largest consumer: ${top.label} (${formatBytes(top.bytes)}, ${share}% of RAM), ${where}.`;
+}
+
 /**
  * The brief injected into the model's context on every request while
  * pressure is elevated — the pi equivalent of BB's contributeInstructions.
  * Returns null when there is nothing worth saying: level ok, or a reading
  * too stale to trust.
  */
-export function contextBrief(pressure: Pressure, now = Date.now()): string | null {
+export function contextBrief(
+  pressure: Pressure,
+  now = Date.now(),
+  top?: TopConsumer | null,
+): string | null {
   if (pressure.level === "ok") return null;
   if (now - pressure.sample.atMs > CONTEXT_STALE_MS) return null;
   const { sample } = pressure;
@@ -85,6 +108,7 @@ export function contextBrief(pressure: Pressure, now = Date.now()): string | nul
   return [
     "Note from ballast, the memory monitor (automatic status, not a user message):",
     `Memory pressure ${parts.join(", ")}.`,
+    ...(top ? [topConsumerLine(top)] : []),
     "Prefer serial over parallel builds and tests. Close browsers and dev servers you started and no longer need. Use ballast_plan before stopping anything you did not start.",
   ].join("\n");
 }
@@ -390,6 +414,35 @@ export class Engine {
     return this.lastPressure;
   }
 
+  /**
+   * The largest non-system consumer the leader recorded at its last snapshot.
+   * Followers never snapshot, so the brief reads it from shared meta; a record
+   * older than the context window is dropped for the same reason a stale
+   * reading is — the guard may have stopped and the name would lie.
+   */
+  topConsumer(now = Date.now()): TopConsumer | null {
+    const top = this.store.getMeta<TopConsumer>(TOP_CONSUMER_KEY);
+    if (top === null || now - top.atMs > CONTEXT_STALE_MS) return null;
+    return top;
+  }
+
+  private recordTopConsumer(consumers: Consumer[], totalBytes: number): void {
+    let top: Consumer | null = null;
+    for (const c of consumers) {
+      if (c.kind !== "system" && (top === null || c.bytes > top.bytes)) top = c;
+    }
+    if (top === null) return;
+    const record: TopConsumer = {
+      label: top.label,
+      kind: top.kind,
+      bytes: top.bytes,
+      threadId: top.threadId,
+      atMs: Date.now(),
+      fraction: totalBytes > 0 ? top.bytes / totalBytes : 0,
+    };
+    this.store.setMeta(TOP_CONSUMER_KEY, record);
+  }
+
   /** Resume whatever a previous guard (or a crashed session) left stopped. */
   resumePaused(pressure: Pressure | null, hooks: GuardHooks = realHooks): void {
     const paused = this.store.getMeta<number[]>("throttle-paused");
@@ -653,6 +706,7 @@ export class Engine {
               lock = null;
               leads = false;
             }
+            if (leads) this.recordTopConsumer(snap.consumers, pressure.sample.totalBytes);
             const plan: Plan | null = leads ? (await this.makePlan(config, snap)).plan : null;
 
             if (plan !== null) this.throttleRung(config, level, plan, pressure, hooks);
